@@ -1,0 +1,95 @@
+From d12e14fd1930a9d142459e5fdc6a9b3b42f04feb Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 01:04:51 -0700
+Subject: [PATCH 09/29] docs: emscripten port notes (build modes, main loop,
+ smoke harness, open issues, roadmap)
+
+---
+ docs/emscripten-port.md | 75 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+ create mode 100644 docs/emscripten-port.md
+
+diff --git a/docs/emscripten-port.md b/docs/emscripten-port.md
+new file mode 100644
+index 00000000..9dccd58d
+--- /dev/null
++++ b/docs/emscripten-port.md
+@@ -0,0 +1,75 @@
++# Emscripten / WebAssembly port notes
++
++Status: **the engine runs in the browser** — wasm64 build boots in Chromium, initializes
++SDL2 + WebGL2, loads a map and runs the frame loop with real GL output. The full engine
++test binary (149,706 assertions / 2,670 tests) is green under node. See git log on the
++`wasm-port` branch for the change trail.
++
++## Build modes (Makefile, EMSCRIPTEN=1)
++
++| Mode | Flags | Use |
++|---|---|---|
++| `EM_FS=node` (default) | `-sNODERAWFS=1` | headless test binaries under node (real FS) |
++| `EM_FS=browser` | no asyncify, `-sEXIT_RUNTIME=0` | browser app (`openwarcraft3.js`) |
++| `EM_FS=node-async` | asyncify + NODERAWFS | experiments only |
++
++Common flags: `-sMEMORY64=1` (**required** — the save format and pathing assume 8-byte
++pointers), `-sSTACK_SIZE=8388608`, `-sUSE_SDL=2`, `-sUSE_ZLIB=1`,
++`-sALLOW_MEMORY_GROWTH=1`, `-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2`,
++`-sFULL_ES3=1` (**required for glMapBufferRange/glUnmapBuffer even on WebGL2**), and
++`-Wl,--allow-multiple-definition` (static single-image link parity with desktop ELF
++module boundaries).
++
++Example browser build:
++
++```
++docker run --rm --user 10000:10000 -e HOME=/tmp -e EM_CACHE=/emsdk/upstream/emscripten/cache \
++  -v <root>:/src -v <root>/emsdk-cache:/emsdk/upstream/emscripten/cache \
++  -w /src/open-realm-em emscripten/emsdk:latest bash -lc \
++  'make EMSCRIPTEN=1 EM_FS=browser GL_BACKEND=gles3 -k -j8 BIN_DIR=build/em-web/bin \
++   LIB_DIR=build/em/lib SHARE_INSTALL=build/em-web/share \
++   EM_PRELOAD="--preload-file /src/webdata@/data --preload-file /src/open-realm-em/build/em-web/share@/share" \
++   build/em-web/bin/openwarcraft3.js'
++```
++
++Flag changes do not retrigger make: `rm -f build/em*/bin/openwarcraft3*` to force relink.
++
++## Browser main loop (no asyncify)
++
++Browser builds use a requestAnimationFrame-driven loop:
++`emscripten_set_main_loop(BZ_Frame, 0, 1)` under `#ifdef __EMSCRIPTEN__` in
++`common/main.c`. **Do not enable ASYNCIFY for the browser build:** it silently wedges the
++engine's cross-module function-pointer calls (idle suspension mid-init at the second
++`mi.FS_ReadFile` call; a related variant crashes with "null function or function
++signature mismatch"). Node test builds are unaffected either way.
++
++## Smoke harness
++
++- Serve `build/em-web/bin/{openwarcraft3.js,.wasm,.data}` + an HTML shell (sets
++  `Module.arguments`, `Module.ENV`, and captures engine stderr into `window.__errors`)
++  over plain HTTP; chromium flag set: `--headless=new --enable-unsafe-swiftshader
++  --autoplay-policy=no-user-gesture-required --remote-debugging-port=<port>`, fresh
++  `--user-data-dir` per asset change.
++- Data: a `webdata/` dir (top-level `.mpq`s + a loose `Maps/` dir) preloaded at `/data`;
++  `share/` preloaded at `/share`. Launch args: `-data /data +map Maps/Transport.w3m`.
++- Drive via CDP: `Runtime.evaluate` probes (`window.__errors`, screenshots via
++  `Page.captureScreenshot`). The Playwright browser tool refuses 127.0.0.1 — use a
++  dedicated chromium + CDP instead.
++
++## Open issues
++
++1. **Menu wedge (browser):** the second menu->client `mi.FS_ReadFile` call in `M_Init`
++   (`UI\FrameDef\GlobalStrings.fdf`) wedges in the browser, with or without asyncify —
++   the first call (`UI_LoadTheme`) always completes; same-module HUD FDF reads are fine;
++   node builds complete the whole batch. The menu FDF batch is therefore deferred under
++   `__EMSCRIPTEN__` in `M_Init` (map launches clear the menu and do not need it).
++2. `test_openwarcraft3_ui` OptionsMenu test crashes with "null function or function
++   signature mismatch" in node wasm (plain and asyncify builds) — likely the same family
++   as (1).
++3. `-sMEMORY64` prints a deprecation notice (prefers `-m64` / `--target=wasm64`).
++
++## Roadmap
++
++- Websocket transport: browser client (WS in `common/net.c` under `__EMSCRIPTEN__`) ->
++  small WS<->UDP bridge -> native dedicated server (`+dedicated 1 +map`).
++- Asset pipeline against a licensed Reforged install (CASC reads, 1.33+ model format).
+-- 
+2.47.3
+

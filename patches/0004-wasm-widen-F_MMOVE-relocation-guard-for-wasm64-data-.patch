@@ -1,0 +1,32 @@
+From a4c615ec51335c53d23a4a1f7d290fed81c5b535 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:22:23 -0700
+Subject: [PATCH 04/29] wasm: widen F_MMOVE relocation guard for wasm64 data
+ layout
+
+- the save system relocates static umove_t pointers as signed 32-bit offsets from a fixed anchor; the +/-64MB sanity bound (sized for one native ELF module image) rejects valid wasm64 offsets (~128MB here), failing all active-move save/load tests
+- wasm builds allow +/-1GB; the animation-string hash still validates every resolved pointer, so corrupt saves remain rejected
+- verified in wasm: wc3_ability_lifecycle 449/449 assertions, wc3_ancient_root 173/173 (both previously failed with move-offset rejections plus a downstream OOB crash)
+---
+ games/warcraft-3/game/g_save.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/games/warcraft-3/game/g_save.c b/games/warcraft-3/game/g_save.c
+index 60d2deec..587118a9 100644
+--- a/games/warcraft-3/game/g_save.c
++++ b/games/warcraft-3/game/g_save.c
+@@ -113,7 +113,11 @@ static uint32_t const save_version = 89;
+ #define SAVE_STREAM_BUFFER (1u << 20) // bytes; save files are several MB of field writes, so a large stdio buffer avoids per-4 KB syscalls
+ #define MAX_SAVE_STRING (1u << 20) // bytes; bounds quest-string allocations from corrupt saves
+ #define MAX_SAVE_GROUP_HANDLES 65536u // corrupt-save bound only; runtime group registry itself grows dynamically
++#if defined(__EMSCRIPTEN__)
++#define UMOVE_RELOC_RANGE (1 << 30) // bytes; wasm64 data segments can sit much farther apart than native ELF module images, so allow a wider relocatable span (the animation hash still validates the target)
++#else
+ #define UMOVE_RELOC_RANGE (64 << 20) // bytes; every umove_t is static data in libgame, so a valid offset from the anchor stays well inside one module image
++#endif
+ 
+ /* F_MMOVE anchor: umove_t instances are file-scope statics, so a move pointer
+  * survives a save as a signed offset from a fixed symbol in the same data segment. */
+-- 
+2.47.3
+

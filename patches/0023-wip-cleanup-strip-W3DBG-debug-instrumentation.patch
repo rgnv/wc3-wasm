@@ -1,0 +1,194 @@
+From 149f9481ccfc4e66159a8af487499768c1431c56 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:03:16 -0700
+Subject: [PATCH 23/29] wip cleanup: strip W3DBG debug instrumentation
+
+Remove the one-shot diagnostic prints left from the fog-of-war, world-pass
+and spawn debugging sessions (fow-update/census counters, fow-send row
+prints, cl_fow/cl_view/cl-fow compose probes, fogtex/revealer probes,
+_W3M_DrawWorld/world-pass layer probes, SP_CallSpawn). No behavior change:
+the reveal/send/loop logic is untouched, only counting and printing.
+Keeper diagnostics (missing FDF bindings, failed loads, renderer warnings)
+are unchanged; the dormant W3_FOWOFF headless override stays.
+---
+ client/cl_parse.c                         |  3 --
+ client/cl_view.c                          |  2 --
+ games/warcraft-3/game/g_fow.c             | 42 +++--------------------
+ games/warcraft-3/game/g_spawn.c           | 10 ------
+ games/warcraft-3/renderer/w3m/r_war3map.c |  2 --
+ renderer/r_fogofwar.c                     |  6 ++--
+ 6 files changed, 6 insertions(+), 59 deletions(-)
+
+diff --git a/client/cl_parse.c b/client/cl_parse.c
+index a4a6a99c..5c44708a 100644
+--- a/client/cl_parse.c
++++ b/client/cl_parse.c
+@@ -798,9 +798,6 @@ static void CL_UpdateFogTextureRows(uint32_t first_row, uint32_t row_count) {
+     explored = cl.fow.explored + first;
+     FOR_LOOP(i, cells)
+         texture[i] = visible[i] ? 255 : (explored[i] ? 128 : 0);
+-    { static int _d3 = 0; _d3++; if (_d3 == 50 || _d3 == 200 || _d3 == 500 || _d3 == 1000) { int _nz = 0;
+-      for (uint32_t _j = 0; _j < (uint32_t)cl.fow.width * cl.fow.height; _j++) if (cl.fow.texture[_j]) _nz++;
+-      fprintf(stderr, "W3DBG cl-fow compose #%d rows=%u..%u nonzero_total=%d\n", _d3, (unsigned)first_row, (unsigned)(first_row + row_count), _nz); } }
+ }
+ 
+ static uint8_t *CL_FogPlaneForStreamIndex(uint32_t flags, uint32_t stream_index) {
+diff --git a/client/cl_view.c b/client/cl_view.c
+index e91d054f..ced42f15 100644
+--- a/client/cl_view.c
++++ b/client/cl_view.c
+@@ -640,7 +640,6 @@ void V_RenderView(void) {
+     bool rebuild;
+     cl.viewDef.weather_effects = cl.weather_effects;
+     cl.viewDef.num_weather_effects = cl.num_weather_effects;
+-    { static int _dbg3 = 0; if (!_dbg3) { _dbg3 = 1; fprintf(stderr, "W3DBG cl_fow w=%u h=%u data=%p\n", (unsigned)cl.fow.width, (unsigned)cl.fow.height, (void *)cl.fow.texture); } }
+     cl.viewDef.fow_width = cl.fow.width;
+     cl.viewDef.fow_height = cl.fow.height;
+     cl.viewDef.fow_data = cl.fow.texture;
+@@ -708,7 +707,6 @@ void V_RenderView(void) {
+ 
+     V_UpdateEnvironmentLighting(&cl.viewDef, true);
+     SCR_SetupViewBlend(&cl.viewDef, &cl.playerstate, cl.pics);
+-    { static int _w3dbg = 0; if (!_w3dbg) { _w3dbg = 1; fprintf(stderr, "W3DBG cl_view main rdflags=0x%x ps_rdflags=0x%x eye=(%.0f %.0f %.0f) yaw=%.1f\n", (unsigned)cl.viewDef.rdflags, (unsigned)cl.playerstate.rdflags, cl.playerstate.vieworigin.x, cl.playerstate.vieworigin.y, cl.playerstate.vieworigin.z, cl.playerstate.viewangles.z); } }
+     re.RenderFrame(&cl.viewDef);
+     CL_DrawTEnts();
+     
+diff --git a/games/warcraft-3/game/g_fow.c b/games/warcraft-3/game/g_fow.c
+index 5c9a433a..6b83d327 100644
+--- a/games/warcraft-3/game/g_fow.c
++++ b/games/warcraft-3/game/g_fow.c
+@@ -1038,50 +1038,20 @@ void G_FowUpdate(void) {
+         G_FowClearVisible(grid);
+     }
+ 
+-    { static int _call = 0;
+-      int _seen = 0, _rad = 0, _total = 0, _inuse = 0, _owned = 0, _nocli = 0, _dead = 0, _sight = 0, _sample = -1;
+-      _call++;
+-      FOR_LOOP(i, globals.num_edicts) {
++    FOR_LOOP(i, globals.num_edicts) {
+         edict_t const *ent = &g_edicts[i];
+         float radius;
+         uint32_t unit_viewers;
+-        _total++;
++
+         if (!ent->inuse) continue;
+-        _inuse++;
+         if (ent->s.player >= MAX_PLAYERS) continue;
+-        _owned++;
+-        if (ent->svflags & SVF_NOCLIENT) { _nocli++; continue; }
+-        if (M_IsDead((edict_t *)ent)) { _dead++; continue; }
+-        if (G_FowEntitySightRadius(ent) > 0.0f) _sight++;
++        if (ent->svflags & SVF_NOCLIENT) continue;
++        if (M_IsDead((edict_t *)ent)) continue;
+         if (!G_FowEntityIsRevealer(ent)) continue;
+         unit_viewers = owner_viewers[ent->s.player] | (ent->shared_vision & viewers);
+         if (!unit_viewers) continue;
+         radius = G_FowEntitySightRadius(ent);
+-        _seen++; if (radius > 0.0f) { _rad++; if (_sample < 0) _sample = i; }
+         G_FowRevealForViewers(ent, radius, unit_viewers);
+-      }
+-      if (_call == 240 || _call == 480 || _call == 960) {
+-        fprintf(stderr, "W3DBG fow-update call=%d edicts=%d inuse=%d owned=%d nocli=%d dead=%d sight_gt0=%d revealers=%d\n", _call, _total, _inuse, _owned, _nocli, _dead, _sight, _seen);
+-        { uint32_t _ids[64]; int _cl[64]; int _n = 0, _zero = 0, _live = 0, _live_nocli = 0, _live_sight = 0, _live_dead = 0;
+-          FOR_LOOP(i, globals.num_edicts) {
+-            edict_t const *ent = &g_edicts[i];
+-            int k;
+-            if (!ent->inuse) continue;
+-            if (!ent->class_id) { _zero++; continue; }
+-            _live++;
+-            if (ent->svflags & SVF_NOCLIENT) _live_nocli++;
+-            if (G_FowEntitySightRadius(ent) > 0.0f) _live_sight++;
+-            if (M_IsDead((edict_t *)ent)) _live_dead++;
+-            for (k = 0; k < _n; k++) if (_ids[k] == ent->class_id) break;
+-            if (k == _n && _n < 64) { _ids[_n] = ent->class_id; _cl[_n] = 0; _n++; }
+-            if (k < _n) _cl[k]++;
+-          }
+-          { extern uint32_t g_UnitBalanceCount, g_UnitUICount, g_DoodadsCount;
+-            fprintf(stderr, "W3DBG census call=%d live=%d live_nocli=%d live_sight=%d live_dead=%d zero_slots=%d ub_rows=%u ui_rows=%u dd_rows=%u:", _call, _live, _live_nocli, _live_sight, _live_dead, _zero, g_UnitBalanceCount, g_UnitUICount, g_DoodadsCount); }
+-          for (int k = 0; k < _n; k++) fprintf(stderr, " %.4s=%d", (char const *)&_ids[k], _cl[k]);
+-          fprintf(stderr, "\n");
+-        }
+-      }
+     }
+ 
+     /* Timed spell reveals are not ordinary sight sources: Far Sight ignores
+@@ -1351,10 +1321,6 @@ static void G_FowSendDirtyPlane(edict_t *ent,
+             count++;
+         }
+         G_FowWriteRows(ent, player, plane_flag, first, count);
+-        { static int _p0 = 0, _p1 = 0;
+-          if (plane_flag == FOW_MSG_VISIBLE_PLANE && _p0 < 2) { _p0++; fprintf(stderr, "W3DBG fow-send visible rows first=%u count=%u\n", (unsigned)first, (unsigned)count); }
+-          if (plane_flag != FOW_MSG_VISIBLE_PLANE && _p1 < 2) { _p1++; fprintf(stderr, "W3DBG fow-send explored rows first=%u count=%u\n", (unsigned)first, (unsigned)count); }
+-        }
+     }
+ }
+ 
+diff --git a/games/warcraft-3/game/g_spawn.c b/games/warcraft-3/game/g_spawn.c
+index efffd2e3..7ddd6d33 100644
+--- a/games/warcraft-3/game/g_spawn.c
++++ b/games/warcraft-3/game/g_spawn.c
+@@ -598,16 +598,6 @@ void SP_CallSpawn(edict_t *edict) {
+         return;
+     edict->s.class_id = edict->class_id;
+     G_BindEntityData(edict);
+-    { static int _d = 0;
+-      if (!_d && (edict->class_id == MAKEFOURCC('h','t','o','w') || edict->class_id == MAKEFOURCC('h','p','e','a') || edict->class_id == MAKEFOURCC('n','g','a','d'))) {
+-        _d = 1;
+-        fprintf(stderr, "W3DBG SP_CallSpawn id=%.4s ub=%p ub_id=%.4s maxhp=%.0f sight=%.0f ui=%p model=%s\n",
+-            (char const *)&edict->class_id, (void *)edict->data.UnitBalance,
+-            (char const *)&edict->data.UnitBalance->id, (double)edict->data.UnitBalance->maxHealth,
+-            (double)edict->data.UnitBalance->sightRadius,
+-            (void *)edict->data.UnitUI, edict->data.UnitUI->modelFile ? edict->data.UnitUI->modelFile : "(null)");
+-      }
+-    }
+     if (edict->data.Doodads->id) {
+         SP_SpawnDoodad(edict);
+     } else if (edict->data.DestructableData->file) {
+diff --git a/games/warcraft-3/renderer/w3m/r_war3map.c b/games/warcraft-3/renderer/w3m/r_war3map.c
+index 5c1e2a9a..64acbe50 100644
+--- a/games/warcraft-3/renderer/w3m/r_war3map.c
++++ b/games/warcraft-3/renderer/w3m/r_war3map.c
+@@ -886,7 +886,6 @@ static void _W3M_SetSceneFog(void) {
+ }
+ 
+ void _W3M_DrawWorld(void) {
+-    { static int _w3dbg2 = 0; if (!_w3dbg2) { int _n = 0; FOR_EACH_LIST(maplayer_t, _l, g_groundLayers) { _n++; } _w3dbg2 = 1; fprintf(stderr, "W3DBG _W3M_DrawWorld rdflags=0x%x layers=%d\n", (unsigned)tr.viewDef.rdflags, _n); } }
+     R_W3UpdateTerrainDeformations();
+     if (w3_terrain_rebuild_pending) {
+         R_W3EmitChangedTerrain();
+@@ -894,7 +893,6 @@ void _W3M_DrawWorld(void) {
+     }
+     if (tr.viewDef.rdflags & RDF_NOWORLDMODEL)
+         return;
+-    { static int _w3dbg3 = 0; if (!_w3dbg3) { int _n = 0; uint32_t _v = 0; maplayer_t *_first = NULL; FOR_EACH_LIST(maplayer_t, _l, g_groundLayers) { _n++; _v += _l->num_vertices; if (!_first) _first = _l; } modelLighting_t _dbgl; bool _lite = R_LightingFromEnviron(&tr.viewDef.terrainLight, &_dbgl); _w3dbg3 = 1; fprintf(stderr, "W3DBG world-pass layers=%d verts=%u drawable=%ux%u vp=(%.2f %.2f %.2f %.2f) sc=(%.2f %.2f %.2f %.2f) lit=%d tex=%p\n", _n, (unsigned)_v, (unsigned)tr.drawableSize.width, (unsigned)tr.drawableSize.height, tr.viewDef.viewport.x, tr.viewDef.viewport.y, tr.viewDef.viewport.w, tr.viewDef.viewport.h, tr.viewDef.scissor.x, tr.viewDef.scissor.y, tr.viewDef.scissor.w, tr.viewDef.scissor.h, (int)_lite, (void *)(_first ? _first->texture : NULL)); } }
+ 
+     R_Call(glEnable, GL_DEPTH_TEST);
+     R_Call(glDepthMask, GL_TRUE);
+diff --git a/renderer/r_fogofwar.c b/renderer/r_fogofwar.c
+index 38a666c0..d51694a6 100644
+--- a/renderer/r_fogofwar.c
++++ b/renderer/r_fogofwar.c
+@@ -275,7 +275,6 @@ void R_RenderFogOfWar(void) {
+     uint32_t const texture_width = (tr.world->width - 1) * 4;
+     uint32_t const texture_height = (tr.world->height - 1) * 4;
+     uint32_t const num_revealers = R_CollectRevealers(revealers, MAX_FOGOFWAR_REVEALERS);
+-    { static int _dbg2 = 0; if (!_dbg2) { _dbg2 = 1; fprintf(stderr, "W3DBG fow-render revealers=%u\n", (unsigned)num_revealers); } }
+ 
+     mat4_t model_matrix;
+     mat4_t proj_matrix;
+@@ -425,10 +424,9 @@ void R_ShutdownFogOfWar(void) {
+ }
+ 
+ uint32_t R_GetFogOfWarTexture(void) {
+-    /* W3DBG-FOGOFF: headless SwiftShader cannot sample the R8 fog network (reads
+-     * black), so this diagnostic build reports full visibility. Remove for ship. */
++    /* Headless SwiftShader cannot sample the R8 fog network (reads black);
++     * W3_FOWOFF=1 forces full visibility for those diagnostics runs. */
+     if (getenv("W3_FOWOFF")) return tr.texture[TEX_WHITE]->texid;
+-    { static int _dbg = 0; if (!_dbg) { _dbg = 1; fprintf(stderr, "W3DBG fogtex network=%u rt=%u white=%u\n", fow_resources.network ? fow_resources.network->texid : 0, fow_resources.rt[FOW_RT_RESULT] ? fow_resources.rt[FOW_RT_RESULT]->texture : 0, tr.texture[TEX_WHITE] ? tr.texture[TEX_WHITE]->texid : 0); } }
+     if (fow_resources.network &&
+         !(tr.viewDef.rdflags & (RDF_NOFOG | RDF_NOWORLDMODEL))) {
+         return fow_resources.network->texid;
+-- 
+2.47.3
+

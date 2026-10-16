@@ -1,0 +1,857 @@
+From 389937e86e3db3001bcfcef8c014b2efe4475112 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:00:16 -0700
+Subject: [PATCH 26/29] campaign: full RoC+TFT campaign playable in the browser
+
+Campaign flow lands end to end: the campaign select lists all nine
+campaigns (five Reign of Chaos, four Frozen Throne) with backdrops, the
+mission list shows chapters plus the authored intro/open/end cinematics
+(camera rows; the browser build plays them through the page overlay since
+it no longer gates them behind BZ_FFMPEG), and missions launch through the
+normal map loader.
+
+- single_player.c: cinematic rows also in __EMSCRIPTEN__ builds;
+  model-cinematic finale rows (Doodads\Cinematic\...\*.mdl) route to
+  the movie import instead of the map loader.
+- cl_movie.c: CL_PlayMovie passes .mdl/.mdx paths to CL_PlayModelCinematic
+  (engine-rendered ending scene) on every platform.
+- common.c: FS_ResolveMapPath fetches a missing explicit map before the
+  existence probe, so campaign paths like Campaign/Classic/ROC/*.w3m
+  resolve on demand from the served mirror.
+- campaign_progress.c: browser builds mirror the progress file through
+  localStorage so a reload resumes the campaign.
+- api natives: 80+ names the campaign scripts and Blizzard.j call now
+  exist (destructable skin creators, IsUnitIdType, AoE damage, dialogue
+  keys, item flags, multiboard getters, ability/unit field setters as
+  accepted no-ops with follow-up notes).  Missing natives unwind whole
+  triggers, so a complete set is what lets missions run.
+- tools: gen-campaign-strings.py builds literal CampaignStrings[_exp].txt
+  from the Reforged campaigninfo + enUS globalstrings (124/124 keys).
+---
+ client/cl_movie.c                             |  11 ++
+ common/common.c                               |   6 +
+ games/warcraft-3/common/campaign_progress.c   |  42 ++++++
+ games/warcraft-3/game/api/api_destructable.h  |  19 +++
+ games/warcraft-3/game/api/api_effect.h        |  22 +++
+ games/warcraft-3/game/api/api_item.h          |  51 +++++++
+ games/warcraft-3/game/api/api_math.h          |   5 +
+ games/warcraft-3/game/api/api_misc.h          |  69 ++++++++++
+ games/warcraft-3/game/api/api_module.c        |  86 ++++++++++++
+ games/warcraft-3/game/api/api_multiboard.h    |  53 +++++++
+ games/warcraft-3/game/api/api_sound.h         |  37 +++++
+ games/warcraft-3/game/api/api_trigger.h       |   8 ++
+ games/warcraft-3/game/api/api_unit.h          | 130 ++++++++++++++++++
+ games/warcraft-3/menu/screens/single_player.c |  21 ++-
+ 14 files changed, 556 insertions(+), 4 deletions(-)
+
+diff --git a/client/cl_movie.c b/client/cl_movie.c
+index 2860388d..1514c27e 100644
+--- a/client/cl_movie.c
++++ b/client/cl_movie.c
+@@ -15,6 +15,9 @@
+ #include <libavformat/avformat.h>
+ #include <libavutil/channel_layout.h>
+ #include <errno.h>
++#ifndef _WIN32
++#include <strings.h>
++#endif
+ #include <libavutil/mathematics.h>
+ #include <libavutil/mem.h>
+ #include <libavutil/samplefmt.h>
+@@ -511,6 +514,14 @@ EMSCRIPTEN_KEEPALIVE void WC3_MovieDone(void) {
+ #endif
+ 
+ bool CL_PlayMovie(cstring_t path) {
++    /* Model-cinematic assets (campaign finale rows, queued ending scenes)
++     * arrive through the same import; render them in-engine. */
++    if (path && *path) {
++        size_t const len = strlen(path);
++        if ((len > 4 && !strcasecmp(path + len - 4, ".mdl")) ||
++            (len > 4 && !strcasecmp(path + len - 4, ".mdx")))
++            return CL_PlayModelCinematic(path);
++    }
+ #ifdef __EMSCRIPTEN__
+     /* Browser: the page owns decoding (a fullscreen <video> overlay); the engine
+      * keeps the movie-active gate until WC3_MovieDone comes back from the page. */
+diff --git a/common/common.c b/common/common.c
+index 2e710071..e10b8fb6 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -1513,6 +1513,12 @@ fsMapResolve_t FS_ResolveMapPath(cstring_t name, string_t out, uint32_t out_size
+     }
+     if (FS_IsExplicitMapPath(name)) {
+         FS_NormalizePath(name, normalized, sizeof(normalized));
++#ifdef __EMSCRIPTEN__
++        /* Browser builds serve the whole catalog on demand (campaign paths
++         * like Campaign/Classic/ROC/*.w3m live outside Maps\).  Pull the
++         * requested map before the existence probe so it resolves. */
++        FS_EnsureRemoteMapFile(normalized);
++#endif
+         if (out && out_size > 0) {
+             snprintf(out, out_size, "%s", normalized);
+         }
+diff --git a/games/warcraft-3/common/campaign_progress.c b/games/warcraft-3/common/campaign_progress.c
+index 3c9617a8..2560146f 100644
+--- a/games/warcraft-3/common/campaign_progress.c
++++ b/games/warcraft-3/common/campaign_progress.c
+@@ -1,6 +1,38 @@
+ #include "campaign_progress.h"
+ 
+ #include <errno.h>
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++/* The browser build keeps user files in the in-memory FS, which a page reload
++ * discards. Mirror the progress file through localStorage so a reload resumes
++ * the campaign instead of resetting to mission one. */
++EM_JS(void, WC3_CampaignProgressPersistJS, (const char *path), {
++    try {
++        var p = UTF8ToString(Number(path));
++        var data = Module.FS.readFile(p);
++        var bin = '';
++        for (var i = 0; i < data.length; i += 0x8000)
++            bin += String.fromCharCode.apply(null, data.subarray(i, i + 0x8000));
++        localStorage.setItem('wc3-campaign-progress', btoa(bin));
++    } catch (e) {}
++});
++EM_JS(void, WC3_CampaignProgressRestoreJS, (const char *path), {
++    try {
++        var p = UTF8ToString(Number(path));
++        var stored = localStorage.getItem('wc3-campaign-progress');
++        if (!stored) return;
++        var exists = true;
++        try { Module.FS.stat(p); } catch (e) { exists = false; }
++        if (exists) return;
++        var bin = atob(stored);
++        var bytes = new Uint8Array(bin.length);
++        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
++        var dir = p.split('/').slice(0, -1).join('/');
++        if (dir) { try { Module.FS.mkdirTree(dir); } catch (e) {} }
++        Module.FS.writeFile(p, bytes);
++    } catch (e) {}
++});
++#endif
+ #ifndef _WIN32
+ #include <strings.h>
+ #endif
+@@ -133,6 +165,13 @@ bool wc3_campaign_progress_load(cstring_t path, wc3CampaignProgress_t *progress)
+ 
+     errno = 0;
+     file = fopen(path, "rb");
++#ifdef __EMSCRIPTEN__
++    if (!file) {
++        WC3_CampaignProgressRestoreJS(path);
++        errno = 0;
++        file = fopen(path, "rb");
++    }
++#endif
+     if (!file) {
+         if (errno != ENOENT) {
+             fprintf(stderr, "Campaign progress: cannot open '%s' for reading: %s\n",
+@@ -231,5 +270,8 @@ bool wc3_campaign_progress_save(cstring_t path, wc3CampaignProgress_t const *pro
+     }
+ 
+     if (had_backup) remove(backup);
++#ifdef __EMSCRIPTEN__
++    WC3_CampaignProgressPersistJS(path);
++#endif
+     return true;
+ }
+diff --git a/games/warcraft-3/game/api/api_destructable.h b/games/warcraft-3/game/api/api_destructable.h
+index e9d1d6ec..f634af3c 100644
+--- a/games/warcraft-3/game/api/api_destructable.h
++++ b/games/warcraft-3/game/api/api_destructable.h
+@@ -9,6 +9,25 @@ uint32_t CreateDestructable(jass_t *j) {
+                                      DEG2RAD(face), scale, variation);
+     return jass_pushlighthandle(j, d, "destructable");
+ }
++/* Blz* wrappers append a skin argument; the engine has one appearance per
++ * object ID, so the skin is accepted and ignored.  Forward-declared bases,
++ * defined below in this file. */
++uint32_t CreateDestructable(jass_t *j);
++uint32_t CreateDestructableZ(jass_t *j);
++uint32_t CreateDeadDestructable(jass_t *j);
++uint32_t CreateDeadDestructableZ(jass_t *j);
++uint32_t BlzCreateDestructableWithSkin(jass_t *j) {
++    return CreateDestructable(j);
++}
++uint32_t BlzCreateDestructableZWithSkin(jass_t *j) {
++    return CreateDestructableZ(j);
++}
++uint32_t BlzCreateDeadDestructableWithSkin(jass_t *j) {
++    return CreateDeadDestructable(j);
++}
++uint32_t BlzCreateDeadDestructableZWithSkin(jass_t *j) {
++    return CreateDeadDestructableZ(j);
++}
+ uint32_t CreateDestructableZ(jass_t *j) {
+     int32_t objectid = jass_checkinteger(j, 1);
+     float x = jass_checknumber(j, 2);
+diff --git a/games/warcraft-3/game/api/api_effect.h b/games/warcraft-3/game/api/api_effect.h
+index 951ae3c3..d9005667 100644
+--- a/games/warcraft-3/game/api/api_effect.h
++++ b/games/warcraft-3/game/api/api_effect.h
+@@ -104,3 +104,25 @@ uint32_t AddSpellEffectTargetById(jass_t *j) {
+     if (!abilityId || !targetWidget || !JassEffectType(j, 2, &type)) return jass_pushnullhandle(j, "effect");
+     return JassPushEffect(j, G_SpawnAbilityEffectTarget(abilityId, type, 0, targetWidget, attachPoint, false));
+ }
++
++/* Campaign / Blizzard.j native batch: ability effect lookup answers empty;
++ * Reforged command-button effects are visual sugar - return a null handle of
++ * the right type so create/destroy pairs keep running. */
++uint32_t GetAbilityEffectById(jass_t *j) { (void)j; return jass_pushstring(j, ""); }
++uint32_t CreateCommandButtonEffect(jass_t *j) {
++    (void)jass_checkinteger(j, 1);
++    (void)jass_checkstring(j, 2);
++    return jass_pushnullhandle(j, "commandbuttoneffect");
++}
++uint32_t CreateLearnCommandButtonEffect(jass_t *j) {
++    (void)jass_checkinteger(j, 1);
++    return jass_pushnullhandle(j, "commandbuttoneffect");
++}
++uint32_t CreateUpgradeCommandButtonEffect(jass_t *j) {
++    (void)jass_checkinteger(j, 1);
++    return jass_pushnullhandle(j, "commandbuttoneffect");
++}
++uint32_t DestroyCommandButtonEffect(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "commandbuttoneffect");
++    return 0;
++}
+diff --git a/games/warcraft-3/game/api/api_item.h b/games/warcraft-3/game/api/api_item.h
+index 912a93f0..e38f92be 100644
+--- a/games/warcraft-3/game/api/api_item.h
++++ b/games/warcraft-3/game/api/api_item.h
+@@ -20,6 +20,26 @@ uint32_t CreateItem(jass_t *j) {
+     edict_t *item = SP_SpawnAtLocation(itemid, 0, &MAKE(vec2_t, x, y));
+     return jass_pushlighthandle(j, item, "item");
+ }
++/* Blz* wrappers add a skin argument; the engine keeps one appearance per
++ * item ID, so the skin is accepted and ignored. */
++uint32_t BlzCreateItemWithSkin(jass_t *j) {
++    int32_t itemid = jass_checkinteger(j, 1);
++    float x = jass_checknumber(j, 2);
++    float y = jass_checknumber(j, 3);
++    ItemData_t const *data;
++
++    if (!itemid) {
++        return jass_pushnullhandle(j, "item");
++    }
++    data = G_ItemData((uint32_t)itemid);
++    if (!data || !data->file) {
++        fprintf(stderr, "BlzCreateItemWithSkin: unresolved item ID 0x%08x at (%.1f, %.1f)\n",
++                (uint32_t)itemid, x, y);
++        return jass_pushnullhandle(j, "item");
++    }
++    edict_t *item = SP_SpawnAtLocation(itemid, 0, &MAKE(vec2_t, x, y));
++    return jass_pushlighthandle(j, item, "item");
++}
+ uint32_t RemoveItem(jass_t *j) {
+     edict_t *whichItem = jass_checkhandle(j, 1, "item");
+     if (whichItem) G_RemoveItem(whichItem);
+@@ -200,3 +220,34 @@ uint32_t SetItemPawnable(jass_t *j) {
+     }
+     return 0;
+ }
++
++/* Campaign / Blizzard.j native batch: item flags are read straight from the
++ * ItemData row; the Reforged field setters are accepted unmodeled. */
++uint32_t IsItemIdPawnable(jass_t *j) {
++    ItemData_t const *data = G_ItemData((uint32_t)jass_checkinteger(j, 1));
++    return jass_pushboolean(j, data ? data->pawnable : 0);
++}
++uint32_t IsItemIdSellable(jass_t *j) {
++    ItemData_t const *data = G_ItemData((uint32_t)jass_checkinteger(j, 1));
++    return jass_pushboolean(j, data ? data->sellable : 0);
++}
++uint32_t IsItemIdPowerup(jass_t *j) {
++    ItemData_t const *data = G_ItemData((uint32_t)jass_checkinteger(j, 1));
++    return jass_pushboolean(j, data ? data->powerup : 0);
++}
++uint32_t IsItemPawnable(jass_t *j) {
++    edict_t *item = jass_checkhandle(j, 1, "item");
++    ItemData_t const *data = item ? G_ItemData(item->class_id) : NULL;
++    return jass_pushboolean(j, data ? data->pawnable : 0);
++}
++uint32_t IsItemSellable(jass_t *j) {
++    edict_t *item = jass_checkhandle(j, 1, "item");
++    ItemData_t const *data = item ? G_ItemData(item->class_id) : NULL;
++    return jass_pushboolean(j, data ? data->sellable : 0);
++}
++uint32_t BlzItemAddAbility(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzItemRemoveAbility(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetItemBooleanField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetItemIntegerField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetItemRealField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetItemStringField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
+diff --git a/games/warcraft-3/game/api/api_math.h b/games/warcraft-3/game/api/api_math.h
+index 2df23f0e..5f1ff24f 100644
+--- a/games/warcraft-3/game/api/api_math.h
++++ b/games/warcraft-3/game/api/api_math.h
+@@ -188,3 +188,8 @@ uint32_t GetLocationZ(jass_t *j) {
+     vec2_t const *whichLocation = jass_checkhandle(j, 1, "location");
+     return jass_pushnumber(j, whichLocation ? CM_GetHeightAtPoint(whichLocation->x, whichLocation->y) : 0);
+ }
++
++/* Campaign / Blizzard.j native batch: Blizzard.j rounds damage/credit values. */
++uint32_t MathRound(jass_t *j) {
++    return jass_pushinteger(j, (int32_t)floorf(jass_checknumber(j, 1) + 0.5f));
++}
+diff --git a/games/warcraft-3/game/api/api_misc.h b/games/warcraft-3/game/api/api_misc.h
+index 87aedac3..656a01f6 100644
+--- a/games/warcraft-3/game/api/api_misc.h
++++ b/games/warcraft-3/game/api/api_misc.h
+@@ -2241,3 +2241,72 @@ uint32_t TriggerRegisterCommandEvent(jass_t *j) {
+     return jass_pushnullhandle(j, "event");
+ }
+ 
++
++/* Campaign / Blizzard.j native batch: terrain/tournament/handicap queries and
++ * the minimap-icon registry.  Minimap icons are not rendered yet - the
++ * creators return null handles (destroy/visibility accept them) so mission
++ * scripts keep running; rendering is the tracked follow-up. */
++uint32_t GetTerrainCliffLevel(jass_t *j) {
++    (void)jass_checknumber(j, 1);
++    (void)jass_checknumber(j, 2);
++    return jass_pushinteger(j, 0);
++}
++uint32_t GetPlayerHandicapDamage(jass_t *j) {
++    player_t *p = jass_checkhandle(j, 1, "player");
++    return jass_pushnumber(j, p ? PLAYER_CLIENT(p)->jass.handicap : 100.0f);
++}
++uint32_t GetPlayerHandicapReviveTime(jass_t *j) {
++    /* No separate revive-time handicap field yet; the classic engine treats
++     * the two values as one. */
++    player_t *p = jass_checkhandle(j, 1, "player");
++    return jass_pushnumber(j, p ? PLAYER_CLIENT(p)->jass.handicap : 100.0f);
++}
++uint32_t GetTournamentScore(jass_t *j) { (void)j; return jass_pushinteger(j, 0); }
++uint32_t GetTournamentFinishNowRule(jass_t *j) { (void)j; return jass_pushinteger(j, 0); }
++uint32_t GetTournamentFinishSoonTimeRemaining(jass_t *j) { (void)j; return jass_pushnumber(j, 0.0f); }
++uint32_t SkinManagerGetLocalPath(jass_t *j) {
++    cstring_t key = jass_checkstring(j, 1);
++    return jass_pushstring(j, key ? key : "");
++}
++uint32_t GetCustomCampaignButtonVisible(jass_t *j) {
++    (void)jass_checkinteger(j, 1);
++    (void)jass_checkhandle(j, 2, "player");
++    return jass_pushboolean(j, 1);
++}
++uint32_t CreateMinimapIcon(jass_t *j) {
++    (void)jass_checknumber(j, 1);
++    (void)jass_checknumber(j, 2);
++    (void)jass_checkinteger(j, 3);
++    (void)jass_checkinteger(j, 4);
++    (void)jass_checkinteger(j, 5);
++    (void)jass_checkstring(j, 6);
++    (void)jass_checkhandle(j, 7, "fogstate");
++    return jass_pushnullhandle(j, "minimapicon");
++}
++uint32_t CreateMinimapIconAtLoc(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "location");
++    (void)jass_checkinteger(j, 2);
++    (void)jass_checkinteger(j, 3);
++    (void)jass_checkinteger(j, 4);
++    (void)jass_checkstring(j, 5);
++    (void)jass_checkhandle(j, 6, "fogstate");
++    return jass_pushnullhandle(j, "minimapicon");
++}
++uint32_t CreateMinimapIconOnUnit(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkinteger(j, 2);
++    (void)jass_checkinteger(j, 3);
++    (void)jass_checkinteger(j, 4);
++    (void)jass_checkstring(j, 5);
++    (void)jass_checkhandle(j, 6, "fogstate");
++    return jass_pushnullhandle(j, "minimapicon");
++}
++uint32_t DestroyMinimapIcon(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "minimapicon");
++    return 0;
++}
++uint32_t SetMinimapIconVisible(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "minimapicon");
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
+diff --git a/games/warcraft-3/game/api/api_module.c b/games/warcraft-3/game/api/api_module.c
+index 62bf68ac..0d331dec 100644
+--- a/games/warcraft-3/game/api/api_module.c
++++ b/games/warcraft-3/game/api/api_module.c
+@@ -234,6 +234,25 @@ jassModule_t jass_funcs[] = {
+     { "S2R", S2R },
+     { "SubString", SubString },
+     { "GetLocalizedString", GetLocalizedString },
++    { "GetTerrainCliffLevel", GetTerrainCliffLevel },
++    { "GetPlayerHandicapDamage", GetPlayerHandicapDamage },
++    { "GetPlayerHandicapReviveTime", GetPlayerHandicapReviveTime },
++    { "GetTournamentScore", GetTournamentScore },
++    { "GetTournamentFinishNowRule", GetTournamentFinishNowRule },
++    { "GetTournamentFinishSoonTimeRemaining", GetTournamentFinishSoonTimeRemaining },
++    { "SkinManagerGetLocalPath", SkinManagerGetLocalPath },
++    { "GetCustomCampaignButtonVisible", GetCustomCampaignButtonVisible },
++    { "CreateMinimapIcon", CreateMinimapIcon },
++    { "CreateMinimapIconAtLoc", CreateMinimapIconAtLoc },
++    { "CreateMinimapIconOnUnit", CreateMinimapIconOnUnit },
++    { "DestroyMinimapIcon", DestroyMinimapIcon },
++    { "SetMinimapIconVisible", SetMinimapIconVisible },
++    { "GetAbilityEffectById", GetAbilityEffectById },
++    { "CreateCommandButtonEffect", CreateCommandButtonEffect },
++    { "CreateLearnCommandButtonEffect", CreateLearnCommandButtonEffect },
++    { "CreateUpgradeCommandButtonEffect", CreateUpgradeCommandButtonEffect },
++    { "DestroyCommandButtonEffect", DestroyCommandButtonEffect },
++    { "MathRound", MathRound },
+     { "GetLocalizedHotkey", GetLocalizedHotkey },
+     { "SetMapName", SetMapName },
+     { "SetMapDescription", SetMapDescription },
+@@ -411,6 +430,7 @@ jassModule_t jass_funcs[] = {
+     { "TriggerRegisterPlayerEvent", TriggerRegisterPlayerEvent },
+     { "GetTriggerPlayer", GetTriggerPlayer },
+     { "TriggerRegisterPlayerUnitEvent", TriggerRegisterPlayerUnitEvent },
++    { "TriggerRegisterUpgradeCommandEvent", TriggerRegisterUpgradeCommandEvent },
+     { "GetLevelingUnit", GetLevelingUnit },
+     { "GetLearningUnit", GetLearningUnit },
+     { "GetLearnedSkill", GetLearnedSkill },
+@@ -512,6 +532,18 @@ jassModule_t jass_funcs[] = {
+     { "SetDestructableAnimationSpeed", SetDestructableAnimationSpeed },
+     { "ShowDestructable", ShowDestructable },
+     { "CreateItem", CreateItem },
++    { "BlzCreateItemWithSkin", BlzCreateItemWithSkin },
++    { "IsItemIdPawnable", IsItemIdPawnable },
++    { "IsItemIdSellable", IsItemIdSellable },
++    { "IsItemIdPowerup", IsItemIdPowerup },
++    { "IsItemPawnable", IsItemPawnable },
++    { "IsItemSellable", IsItemSellable },
++    { "BlzItemAddAbility", BlzItemAddAbility },
++    { "BlzItemRemoveAbility", BlzItemRemoveAbility },
++    { "BlzSetItemBooleanField", BlzSetItemBooleanField },
++    { "BlzSetItemIntegerField", BlzSetItemIntegerField },
++    { "BlzSetItemRealField", BlzSetItemRealField },
++    { "BlzSetItemStringField", BlzSetItemStringField },
+     { "RemoveItem", RemoveItem },
+     { "GetItemPlayer", GetItemPlayer },
+     { "GetItemTypeId", GetItemTypeId },
+@@ -534,6 +566,10 @@ jassModule_t jass_funcs[] = {
+     { "CreateUnit", CreateUnit },
+     { "CreateUnitByName", CreateUnitByName },
+     { "BlzCreateUnitWithSkin", BlzCreateUnitWithSkin },
++    { "BlzCreateDestructableWithSkin", BlzCreateDestructableWithSkin },
++    { "BlzCreateDestructableZWithSkin", BlzCreateDestructableZWithSkin },
++    { "BlzCreateDeadDestructableWithSkin", BlzCreateDeadDestructableWithSkin },
++    { "BlzCreateDeadDestructableZWithSkin", BlzCreateDeadDestructableZWithSkin },
+     { "CreateUnitAtLoc", CreateUnitAtLoc },
+     { "CreateUnitAtLocByName", CreateUnitAtLocByName },
+     { "CreateCorpse", CreateCorpse },
+@@ -666,6 +702,42 @@ jassModule_t jass_funcs[] = {
+     { "UnitSuspendDecay", UnitSuspendDecay },
+     { "UnitAddAbility", UnitAddAbility },
+     { "UnitRemoveAbility", UnitRemoveAbility },
++    { "BlzUnitDisableAbility", BlzUnitDisableAbility },
++    { "BlzSetUnitBooleanField", BlzSetUnitBooleanField },
++    { "BlzSetUnitIntegerField", BlzSetUnitIntegerField },
++    { "BlzSetUnitRealField", BlzSetUnitRealField },
++    { "BlzSetUnitStringField", BlzSetUnitStringField },
++    { "BlzSetUnitWeaponBooleanField", BlzSetUnitWeaponBooleanField },
++    { "BlzSetUnitWeaponIntegerField", BlzSetUnitWeaponIntegerField },
++    { "BlzSetUnitWeaponRealField", BlzSetUnitWeaponRealField },
++    { "BlzSetUnitWeaponStringField", BlzSetUnitWeaponStringField },
++    { "BlzSetAbilityBooleanField", BlzSetAbilityBooleanField },
++    { "BlzSetAbilityBooleanLevelField", BlzSetAbilityBooleanLevelField },
++    { "BlzSetAbilityBooleanLevelArrayField", BlzSetAbilityBooleanLevelArrayField },
++    { "BlzSetAbilityIntegerField", BlzSetAbilityIntegerField },
++    { "BlzSetAbilityIntegerLevelField", BlzSetAbilityIntegerLevelField },
++    { "BlzSetAbilityIntegerLevelArrayField", BlzSetAbilityIntegerLevelArrayField },
++    { "BlzSetAbilityRealField", BlzSetAbilityRealField },
++    { "BlzSetAbilityRealLevelField", BlzSetAbilityRealLevelField },
++    { "BlzSetAbilityRealLevelArrayField", BlzSetAbilityRealLevelArrayField },
++    { "BlzSetAbilityStringField", BlzSetAbilityStringField },
++    { "BlzSetAbilityStringLevelField", BlzSetAbilityStringLevelField },
++    { "BlzSetAbilityStringLevelArrayField", BlzSetAbilityStringLevelArrayField },
++    { "BlzAddAbilityBooleanLevelArrayField", BlzAddAbilityBooleanLevelArrayField },
++    { "BlzAddAbilityIntegerLevelArrayField", BlzAddAbilityIntegerLevelArrayField },
++    { "BlzAddAbilityRealLevelArrayField", BlzAddAbilityRealLevelArrayField },
++    { "BlzAddAbilityStringLevelArrayField", BlzAddAbilityStringLevelArrayField },
++    { "BlzRemoveAbilityBooleanLevelArrayField", BlzRemoveAbilityBooleanLevelArrayField },
++    { "BlzRemoveAbilityIntegerLevelArrayField", BlzRemoveAbilityIntegerLevelArrayField },
++    { "BlzRemoveAbilityRealLevelArrayField", BlzRemoveAbilityRealLevelArrayField },
++    { "BlzRemoveAbilityStringLevelArrayField", BlzRemoveAbilityStringLevelArrayField },
++    { "IsUnitIdType", IsUnitIdType },
++    { "DecUnitAbilityLevel", DecUnitAbilityLevel },
++    { "UnitDamagePoint", UnitDamagePoint },
++    { "UnitDropItemSlot", UnitDropItemSlot },
++    { "UnitDropItemTarget", UnitDropItemTarget },
++    { "UnitSetConstructionProgress", UnitSetConstructionProgress },
++    { "UnitSetUpgradeProgress", UnitSetUpgradeProgress },
+     { "UnitMakeAbilityPermanent", UnitMakeAbilityPermanent },
+     { "UnitRemoveBuffs", UnitRemoveBuffs },
+     { "UnitRemoveBuffsEx", UnitRemoveBuffsEx },
+@@ -960,6 +1032,12 @@ jassModule_t jass_funcs[] = {
+     { "CreateMultiboard", CreateMultiboard },
+     { "DestroyMultiboard", DestroyMultiboard },
+     { "MultiboardDisplay", MultiboardDisplay },
++    { "MultiboardGetRowCount", MultiboardGetRowCount },
++    { "MultiboardGetColumnCount", MultiboardGetColumnCount },
++    { "MultiboardGetTitleText", MultiboardGetTitleText },
++    { "MultiboardSetItemsValue", MultiboardSetItemsValue },
++    { "MultiboardSetItemsIcon", MultiboardSetItemsIcon },
++    { "MultiboardSetItemsValueColor", MultiboardSetItemsValueColor },
+     { "IsMultiboardDisplayed", IsMultiboardDisplayed },
+     { "MultiboardSuppressDisplay", MultiboardSuppressDisplay },
+     { "MultiboardMinimize", MultiboardMinimize },
+@@ -1050,6 +1128,14 @@ jassModule_t jass_funcs[] = {
+     { "CreateMIDISound", CreateMIDISound },
+     { "SetSoundParamsFromLabel", SetSoundParamsFromLabel },
+     { "SetSoundDistanceCutoff", SetSoundDistanceCutoff },
++    { "SetSoundFacialAnimationLabel", SetSoundFacialAnimationLabel },
++    { "SetSoundFacialAnimationGroupLabel", SetSoundFacialAnimationGroupLabel },
++    { "SetSoundFacialAnimationSetFilepath", SetSoundFacialAnimationSetFilepath },
++    { "SetDialogueSpeakerNameKey", SetDialogueSpeakerNameKey },
++    { "SetDialogueTextKey", SetDialogueTextKey },
++    { "GetDialogueSpeakerNameKey", GetDialogueSpeakerNameKey },
++    { "GetDialogueTextKey", GetDialogueTextKey },
++    { "GetAbilitySoundById", GetAbilitySoundById },
+     { "SetSoundChannel", SetSoundChannel },
+     { "SetSoundVolume", SetSoundVolume },
+     { "SetSoundPitch", SetSoundPitch },
+diff --git a/games/warcraft-3/game/api/api_multiboard.h b/games/warcraft-3/game/api/api_multiboard.h
+index f4df0484..32c5183f 100644
+--- a/games/warcraft-3/game/api/api_multiboard.h
++++ b/games/warcraft-3/game/api/api_multiboard.h
+@@ -189,6 +189,59 @@ uint32_t MultiboardSetItemsWidth(jass_t *j) {
+     return 0;
+ }
+ 
++uint32_t MultiboardGetRowCount(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    return jass_pushinteger(j, board ? (int32_t)board->rows : 0);
++}
++
++uint32_t MultiboardGetColumnCount(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    return jass_pushinteger(j, board ? (int32_t)board->cols : 0);
++}
++
++uint32_t MultiboardGetTitleText(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    return jass_pushstring(j, board ? board->title : "");
++}
++
++static void multiboard_set_value_cell(struct gmultiboardcell_s *cell, void *ud) {
++    strlcpy(cell->value, G_LevelString((cstring_t)ud), sizeof(cell->value));
++}
++
++static void multiboard_set_icon_cell(struct gmultiboardcell_s *cell, void *ud) {
++    strlcpy(cell->icon, G_LevelString((cstring_t)ud), sizeof(cell->icon));
++}
++
++static void multiboard_set_value_color_cell(struct gmultiboardcell_s *cell, void *ud) {
++    cell->value_color = *(color32_t *)ud;
++    cell->value_color_set = true;
++}
++
++uint32_t MultiboardSetItemsValue(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    cstring_t value = jass_checkstring(j, 2);
++    multiboard_each_cell(board, multiboard_set_value_cell, (void *)(value ? value : ""));
++    G_MarkMultiboardDirty(board);
++    return 0;
++}
++
++uint32_t MultiboardSetItemsIcon(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    cstring_t icon = jass_checkstring(j, 2);
++    multiboard_each_cell(board, multiboard_set_icon_cell, (void *)(icon ? icon : ""));
++    G_MarkMultiboardDirty(board);
++    return 0;
++}
++
++uint32_t MultiboardSetItemsValueColor(jass_t *j) {
++    multiboard_t *board = jass_checkhandle(j, 1, "multiboard");
++    color32_t color = multiboard_color(jass_checkinteger(j, 2), jass_checkinteger(j, 3),
++                                       jass_checkinteger(j, 4), jass_checkinteger(j, 5));
++    multiboard_each_cell(board, multiboard_set_value_color_cell, &color);
++    G_MarkMultiboardDirty(board);
++    return 0;
++}
++
+ uint32_t CreateTextTag(jass_t *j) {
+     texttag_t *tag = G_AllocTextTag();
+     if (!tag) {
+diff --git a/games/warcraft-3/game/api/api_sound.h b/games/warcraft-3/game/api/api_sound.h
+index 3aa06b2c..ca1a1abe 100644
+--- a/games/warcraft-3/game/api/api_sound.h
++++ b/games/warcraft-3/game/api/api_sound.h
+@@ -88,6 +88,36 @@ uint32_t SetSoundParamsFromLabel(jass_t *j) {
+         G_JassSoundSetVolume(sound, volume);
+     return 0;
+ }
++/* Reforged-era native set not modeled yet.  Blizzard.j / campaign scripts
++ * call these, and a missing native unwinds the whole trigger, so accept the
++ * call (validating arguments) and report success instead of breaking the
++ * mission.  Portrait facial animation and the dialogue panel are visual
++ * follow-ups. */
++uint32_t SetSoundFacialAnimationLabel(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkstring(j, 2);
++    return jass_pushboolean(j, true);
++}
++uint32_t SetSoundFacialAnimationGroupLabel(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkstring(j, 2);
++    return jass_pushboolean(j, true);
++}
++uint32_t SetSoundFacialAnimationSetFilepath(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkstring(j, 2);
++    return jass_pushboolean(j, true);
++}
++uint32_t SetDialogueSpeakerNameKey(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkstring(j, 2);
++    return jass_pushboolean(j, true);
++}
++uint32_t SetDialogueTextKey(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkstring(j, 2);
++    return jass_pushboolean(j, true);
++}
+ uint32_t SetSoundDistanceCutoff(jass_t *j) {
+     //handle_t soundHandle = jass_checkhandle(j, 1, "sound");
+     //float cutoff = jass_checknumber(j, 2);
+@@ -295,3 +325,10 @@ uint32_t UnregisterStackedSound(jass_t *j) {
+     //float rectheight = jass_checknumber(j, 4);
+     return 0;
+ }
++
++/* Campaign / Blizzard.j native batch: the dialogue getters pair with the
++ * accepted setters above (text is not stored yet), and the ability sound
++ * lookup answers empty rather than unwinding. */
++uint32_t GetDialogueSpeakerNameKey(jass_t *j) { (void)j; return jass_pushstring(j, ""); }
++uint32_t GetDialogueTextKey(jass_t *j) { (void)j; return jass_pushstring(j, ""); }
++uint32_t GetAbilitySoundById(jass_t *j) { (void)j; return jass_pushstring(j, ""); }
+diff --git a/games/warcraft-3/game/api/api_trigger.h b/games/warcraft-3/game/api/api_trigger.h
+index 4da131db..c82a1fd6 100644
+--- a/games/warcraft-3/game/api/api_trigger.h
++++ b/games/warcraft-3/game/api/api_trigger.h
+@@ -662,3 +662,11 @@ uint32_t GetTriggerDestructable(jass_t *j) {
+         jass_getcontext(j)->unit,
+         "destructable");
+ }
++
++/* Campaign / Blizzard.j native batch: the upgrade-command category is not
++ * wired into the event system yet; accept the registration so callers run. */
++uint32_t TriggerRegisterUpgradeCommandEvent(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "trigger");
++    (void)jass_checkinteger(j, 2);
++    return jass_pushnullhandle(j, "event");
++}
+diff --git a/games/warcraft-3/game/api/api_unit.h b/games/warcraft-3/game/api/api_unit.h
+index e940449a..25cf5f16 100644
+--- a/games/warcraft-3/game/api/api_unit.h
++++ b/games/warcraft-3/game/api/api_unit.h
+@@ -1084,6 +1084,15 @@ uint32_t UnitRemoveAbility(jass_t *j) {
+     uint32_t abilityId = jass_checkinteger(j, 2);
+     return jass_pushboolean(j, G_ActorRemoveSkill(whichUnit, abilityId));
+ }
++/* Reforged-era ability lockout; the engine has no disabled-skill state yet,
++ * so accept the call rather than unwinding the caller's trigger. */
++uint32_t BlzUnitDisableAbility(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkinteger(j, 2);
++    (void)jass_checkboolean(j, 3);
++    (void)jass_checkboolean(j, 4);
++    return 0;
++}
+ uint32_t UnitMakeAbilityPermanent(jass_t *j) {
+     edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+     bool permanent = jass_checkboolean(j, 2);
+@@ -1379,3 +1388,124 @@ uint32_t CreateBlightedGoldmine(jass_t *j) {
+         return jass_pushnullhandle(j, "unit");
+     return jass_pushlighthandle(j, mine, "unit");
+ }
++
++/* ------------------------------------------------------------------------- *
++ * Campaign / Blizzard.j native batch (2026-10).  The mission maps call the
++ * four Blz destructable creators and IsUnitIdType; Blizzard.j runtime paths
++ * additionally need the ability/unit field setters, item drops, scripted
++ * ability levels and AoE damage.  See casc-tools/impl-missing-natives.py.
++ * ------------------------------------------------------------------------- */
++uint32_t IsUnitIdType(jass_t *j) {
++    int32_t unitId = jass_checkinteger(j, 1);
++    uint32_t unitType = (uint32_t)jass_checkinteger(j, 2);
++    UnitData_t const *data = G_UnitData((uint32_t)unitId);
++
++    if (!data) return jass_pushboolean(j, 0);
++    if (unitType == WC3_UNIT_TYPE_STRUCTURE) {
++        return jass_pushboolean(j, G_UnitIsBuilding((uint32_t)unitId));
++    }
++    if (unitType == 3) { /* UNIT_TYPE_FLYING (no shared constant yet) */
++        return jass_pushboolean(j, data->moveTypeName && strstr(data->moveTypeName, "fly") != NULL);
++    }
++    if (unitType == WC3_UNIT_TYPE_GROUND) {
++        return jass_pushboolean(j, !(data->moveTypeName && strstr(data->moveTypeName, "fly") != NULL));
++    }
++    /* Remaining types (hero/dead/summoned/...) need classifications the unit
++     * row does not carry yet; report false rather than unwinding callers. */
++    return jass_pushboolean(j, 0);
++}
++
++uint32_t DecUnitAbilityLevel(jass_t *j) {
++    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
++    int32_t abilcode = jass_checkinteger(j, 2);
++    uint32_t cur;
++
++    if (!whichUnit) return jass_pushinteger(j, 0);
++    cur = G_UnitAbilityLevel(whichUnit, (uint32_t)abilcode);
++    if (!cur) return jass_pushinteger(j, 0);
++    return jass_pushinteger(j, (int32_t)G_UnitSetAbilityLevel(whichUnit, (uint32_t)abilcode, (int32_t)cur - 1));
++}
++
++uint32_t UnitDamagePoint(jass_t *j) {
++    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
++    (void)jass_checknumber(j, 2); /* delay; retail defers the hit, we apply at once */
++    float radius = jass_checknumber(j, 3);
++    float x = jass_checknumber(j, 4);
++    float y = jass_checknumber(j, 5);
++    float amount = jass_checknumber(j, 6);
++
++    (void)jass_checkboolean(j, 7);
++    (void)jass_checkboolean(j, 8);
++    (void)jass_checkhandle(j, 9, "attacktype");
++    (void)jass_checkhandle(j, 10, "damagetype");
++    (void)jass_checkhandle(j, 11, "weapontype");
++    if (!whichUnit || amount <= 0.0f || radius < 0.0f) return jass_pushboolean(j, 0);
++    FOR_LOOP(i, globals.num_edicts) {
++        edict_t *ent = &globals.edicts[i];
++        vec2_t center = MAKE(vec2_t, x, y);
++
++        /* IS_UNIT lives in api_group.h, which is included after this file. */
++        if (!(ent->svflags & SVF_MONSTER) || G_IsDeferredFree(ent) || ent->invulnerable || M_IsDead(ent)) continue;
++        if (Vector2_distance(&ent->s.origin2, &center) <= radius) {
++            T_Damage(ent, whichUnit, (int)amount);
++        }
++    }
++    return jass_pushboolean(j, 1);
++}
++
++/* Scripted drop helpers: the inventory relocation API does not expose slot
++ * moves yet, so report the drop as refused; scripts already branch on it. */
++uint32_t UnitDropItemSlot(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkhandle(j, 2, "item");
++    (void)jass_checkinteger(j, 3);
++    return jass_pushboolean(j, 0);
++}
++uint32_t UnitDropItemTarget(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkhandle(j, 2, "item");
++    (void)jass_checkhandle(j, 3, "widget");
++    return jass_pushboolean(j, 0);
++}
++uint32_t UnitSetConstructionProgress(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkinteger(j, 2);
++    return 0;
++}
++uint32_t UnitSetUpgradeProgress(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkinteger(j, 2);
++    return 0;
++}
++
++/* Reforged field setters.  Field edits (armor/damage/tooltips authored at
++ * runtime) are not modeled; accept the call and report success so scripted
++ * loadouts keep running. */
++uint32_t BlzSetUnitBooleanField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitIntegerField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitRealField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitStringField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitWeaponBooleanField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitWeaponIntegerField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitWeaponRealField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetUnitWeaponStringField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityBooleanField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityBooleanLevelField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityBooleanLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityIntegerField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityIntegerLevelField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityIntegerLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityRealField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityRealLevelField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityRealLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityStringField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityStringLevelField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzSetAbilityStringLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzAddAbilityBooleanLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzAddAbilityIntegerLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzAddAbilityRealLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzAddAbilityStringLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzRemoveAbilityBooleanLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzRemoveAbilityIntegerLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzRemoveAbilityRealLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
++uint32_t BlzRemoveAbilityStringLevelArrayField(jass_t *j) { (void)j; return jass_pushboolean(j, 1); }
+diff --git a/games/warcraft-3/menu/screens/single_player.c b/games/warcraft-3/menu/screens/single_player.c
+index da3d533f..ea69d2c8 100644
+--- a/games/warcraft-3/menu/screens/single_player.c
++++ b/games/warcraft-3/menu/screens/single_player.c
+@@ -755,6 +755,15 @@ static bool SinglePlayer_ShowMission(singlePlayerCampaign_t const *campaign, uin
+     return mission_index == 0 && SinglePlayer_ShowCampaign(campaign);
+ }
+ 
++/* The Undead-expansion finale and similar rows point at model cinematics
++ * (Doodads\Cinematic\...\*.mdl) rather than maps; the client plays those
++ * in-engine, so route them through the movie import instead of "map". */
++static bool SinglePlayer_PathIsModel(cstring_t path) {
++    size_t const len = path ? strlen(path) : 0;
++    return (len > 4 && !strcasecmp(path + len - 4, ".mdl")) ||
++           (len > 4 && !strcasecmp(path + len - 4, ".mdx"));
++}
++
+ static void SinglePlayer_LaunchMission(singlePlayerCampaign_t const *campaign, uint32_t mission_index) {
+     char command[MAX_PATHLEN + 7];
+     cstring_t map_path;
+@@ -762,11 +771,15 @@ static void SinglePlayer_LaunchMission(singlePlayerCampaign_t const *campaign, u
+     if (!campaign || mission_index >= campaign->num_missions) return;
+     map_path = campaign->missions[mission_index].map_path;
+     if (!map_path[0]) return;
++    if (SinglePlayer_PathIsModel(map_path)) {
++        if (mi.PlayMovie) mi.PlayMovie(map_path);
++        return;
++    }
+     snprintf(command, sizeof(command), "map \"%s\"", map_path);
+     UI_QueueCommand(command);
+ }
+ 
+-#ifdef BZ_FFMPEG
++#if defined(BZ_FFMPEG) || defined(__EMSCRIPTEN__)
+ static void SinglePlayer_MovieAssetPath(cstring_t movie, string_t out, uint32_t out_size) {
+     if (!out || !out_size) {
+         return;
+@@ -819,7 +832,7 @@ static void SinglePlayer_PopulateMissionList(singlePlayerCampaign_t const *campa
+         return;
+     }
+ 
+-#ifdef BZ_FFMPEG
++#if defined(BZ_FFMPEG) || defined(__EMSCRIPTEN__)
+     /* Campaign cinematics surround the playable mission sequence. Intro is
+      * the campaign-wide introductory movie, Open is the campaign opening, and
+      * End belongs after the final mission. Keep the temporary text rows in
+@@ -849,7 +862,7 @@ static void SinglePlayer_PopulateMissionList(singlePlayerCampaign_t const *campa
+         item->flags = i;
+     }
+ 
+-#ifdef BZ_FFMPEG
++#if defined(BZ_FFMPEG) || defined(__EMSCRIPTEN__)
+     SinglePlayer_AddCinematicItem(campaign, SINGLE_PLAYER_CINEMATIC_END);
+ #endif
+ }
+@@ -1240,7 +1253,7 @@ void SinglePlayerMenu_LaunchMissionIndex(uint32_t index) {
+     }
+     mission_list.selected = index;
+     item_flags = mission_list.items[index].flags;
+-#ifdef BZ_FFMPEG
++#if defined(BZ_FFMPEG) || defined(__EMSCRIPTEN__)
+     if (item_flags & SINGLE_PLAYER_LIST_FLAG_CINEMATIC) {
+         mi.PlayMovie(mission_list.items[index].path);
+         return;
+-- 
+2.47.3
+

@@ -1,0 +1,90 @@
+From 109695c1e0ad33e0d6f6b50a4573ad8dbced4ef4 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:21:06 -0700
+Subject: [PATCH 29/29] fetch-on-demand: base64 sidecars for text files +
+ short-read guard
+
+Browsers text-decode look-alike bodies on the synchronous-XHR path even when
+the server declares a binary Content-Type, silently truncating non-ASCII files
+(the UI parser then ran off the end of a short GlobalStrings.fdf buffer and
+trapped). The page now preloads gamedata/b64.index.txt; listed files are
+fetched from <path>.b64 sidecars and decoded here, guaranteeing exact bytes.
+Plain reads also refuse short responses instead of writing corrupt files.
+---
+ common/common.c | 46 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/common/common.c b/common/common.c
+index 8567cdf1..2b1c0e72 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -1063,15 +1063,32 @@ EM_JS(int, WC3_FetchRemoteFile, (const char *diskPathC, const char *relNameC), {
+     var rel = UTF8ToString(Number(relNameC)).split(String.fromCharCode(92)).join('/').replace(/^[/]+/, '').toLowerCase();
+     if (!rel) return 0;
+     var base = (typeof Module !== 'undefined' && Module.WC3_DATA_BASE) ? Module.WC3_DATA_BASE : 'gamedata/';
+-    var url = base + rel.split('/').map(encodeURIComponent).join('/');
+     var dataV = (typeof Module !== 'undefined' && Module.WC3_DATA_V) ? Module.WC3_DATA_V : '';
++    var pathPart = rel.split('/').map(encodeURIComponent).join('/');
++    /* Browsers decode text-looking bodies on the sync-XHR text path, collapsing
++     * multi-byte UTF-8 characters (corrupting .fdf/.txt-style files). The page
++     * preloads b64.index.txt; listed files are served as <path>.b64 sidecars
++     * and decoded here so the engine always receives exact bytes. */
++    var b64set = (typeof Module !== 'undefined' && Module.WC3_B64_SET) ? Module.WC3_B64_SET : null;
++    var useB64 = !!(b64set && b64set.has(rel));
++    var url = base + pathPart + (useB64 ? '.b64' : '');
+     if (dataV) url += '?v=' + dataV;
+     var xhr = new XMLHttpRequest();
+     try {
+         xhr.open('GET', url, false);
+         xhr.overrideMimeType('text/plain; charset=x-user-defined');
+         xhr.send(null);
+-        if (xhr.status !== 200 && /\.blp$/.test(rel)) {
++        if (xhr.status !== 200 && useB64) {
++            /* mirror without the sidecar: fall back to the plain file */
++            useB64 = false;
++            url = base + pathPart;
++            if (dataV) url += '?v=' + dataV;
++            xhr = new XMLHttpRequest();
++            xhr.open('GET', url, false);
++            xhr.overrideMimeType('text/plain; charset=x-user-defined');
++            xhr.send(null);
++        }
++        if (xhr.status !== 200 && !useB64 && /\.blp$/.test(rel)) {
+             /* SD Reforged data stores many textures as .dds while the engine
+              * asks for .blp; retry the .dds store form and write its bytes at
+              * the asked path (the decoders sniff the container). */
+@@ -1085,9 +1102,28 @@ EM_JS(int, WC3_FetchRemoteFile, (const char *diskPathC, const char *relNameC), {
+         }
+     } catch (e) { return 0; }
+     if (xhr.status !== 200 || !xhr.responseText.length) return 0;
+-    var s = xhr.responseText, n = s.length;
+-    var u8 = new Uint8Array(n);
+-    for (var i = 0; i < n; i++) u8[i] = s.charCodeAt(i) & 0xff;
++    var s = xhr.responseText, n, u8;
++    if (useB64) {
++        var bin;
++        try { bin = atob(s); } catch (e) { return 0; }
++        n = bin.length;
++        u8 = new Uint8Array(n);
++        for (var i = 0; i < n; i++) u8[i] = bin.charCodeAt(i) & 0xff;
++    } else {
++        n = s.length;
++        /* Guard: a short read means the browser text-decoded the body (its
++         * sniffing ignores the declared charset for text-looking files). Never
++         * write a corrupt file — report it and let the engine treat it as
++         * missing. */
++        var cl = xhr.getResponseHeader('content-length');
++        if (cl && !xhr.getResponseHeader('content-encoding') && parseInt(cl, 10) !== n) {
++            console.log('[fetch-on-demand] SIZE MISMATCH ' + diskPath + ' <- ' + url +
++                        ' (got ' + n + ' of ' + cl + ' bytes)');
++            return 0;
++        }
++        u8 = new Uint8Array(n);
++        for (var i = 0; i < n; i++) u8[i] = s.charCodeAt(i) & 0xff;
++    }
+     var FS = Module.FS || (typeof FS !== 'undefined' ? FS : null);
+     if (!FS) return 0;
+     try {
+-- 
+2.47.3
+

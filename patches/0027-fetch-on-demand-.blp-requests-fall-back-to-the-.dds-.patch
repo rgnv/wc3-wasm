@@ -1,0 +1,40 @@
+From a448d1b10aea2f0b6a452830fc5ad17a2b426ecc Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:20:45 -0700
+Subject: [PATCH 27/29] fetch-on-demand: .blp requests fall back to the .dds
+ store form
+
+SD Reforged data stores many textures as .dds while the engine asks for
+.blp; the fetch retries the .dds URL and writes its bytes at the asked
+path, matching the native backfill behavior.  Verified live on campaign
+hero info-panel icons.
+---
+ common/common.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/common/common.c b/common/common.c
+index e10b8fb6..8567cdf1 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -1071,6 +1071,18 @@ EM_JS(int, WC3_FetchRemoteFile, (const char *diskPathC, const char *relNameC), {
+         xhr.open('GET', url, false);
+         xhr.overrideMimeType('text/plain; charset=x-user-defined');
+         xhr.send(null);
++        if (xhr.status !== 200 && /\.blp$/.test(rel)) {
++            /* SD Reforged data stores many textures as .dds while the engine
++             * asks for .blp; retry the .dds store form and write its bytes at
++             * the asked path (the decoders sniff the container). */
++            var alt = base + rel.replace(/\.blp$/, '.dds').split('/').map(encodeURIComponent).join('/');
++            if (dataV) alt += '?v=' + dataV;
++            var x2 = new XMLHttpRequest();
++            x2.open('GET', alt, false);
++            x2.overrideMimeType('text/plain; charset=x-user-defined');
++            x2.send(null);
++            if (x2.status === 200 && x2.responseText.length) xhr = x2;
++        }
+     } catch (e) { return 0; }
+     if (xhr.status !== 200 || !xhr.responseText.length) return 0;
+     var s = xhr.responseText, n = s.length;
+-- 
+2.47.3
+

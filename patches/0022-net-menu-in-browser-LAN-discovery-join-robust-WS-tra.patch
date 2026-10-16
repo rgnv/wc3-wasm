@@ -1,0 +1,258 @@
+From 118c2f137bfc4286d41af59cd1ec3be59e637b5d Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:44:35 -0700
+Subject: [PATCH 22/29] net+menu: in-browser LAN discovery/join; robust WS
+ transport
+
+Browser multiplayer round-trip end-to-end (verified live): LAN refresh
+-> server listed -> join -> lobby -> host presses Start in the setup
+screen -> match loads and renders.
+
+- cl_main: accept NA_BROADCAST 'info' replies (the WS bridge echoes our
+  own broadcast destination as the packet source); add WC3_DebugMenuCommand
+  (KEEPALIVE test hook to drive menu commands from the page); cl_timeout
+  cvar (default 120s) replaces the fixed 10s netchan silence window that
+  disconnected clients during cold real-data world loads.
+- net.c: NET_WS_Open reuses the live bridge socket; reopening left
+  net_ws_opened stale and sends threw InvalidStateError (uncaught page
+  error, black canvas) whenever the engine reconfigured the transport
+  (each LAN refresh).
+- cl_parse: read the lobby host flag in its wire position (local_slot ->
+  is_host -> revision); the misplaced read shifted the revision.
+- sv_lobby: dedicated servers skip their boot-time loopback client when
+  electing the lobby host (first remote player becomes host).
+- bridge.mjs: --host listen address arg; run-dedicated-browser.sh: real
+  data lobby, config-first command order, delayed until the console is
+  free (pipe coalescing swallowed early commands during long loads).
+- Makefile: export ccall/cwrap/stringToUTF8 runtime methods.
+---
+ Makefile                                 |  2 +-
+ client/cl_main.c                         | 26 ++++++++++++++++++++++-
+ client/cl_parse.c                        |  3 +--
+ common/cvar.c                            |  1 +
+ common/net.c                             |  8 +++++++
+ server/sv_lobby.c                        | 12 +++++++++--
+ tools/ws-bridge/bridge.mjs               |  5 +++--
+ tools/ws-bridge/run-dedicated-browser.sh | 27 ++++++++++++++++++++++++
+ 8 files changed, 76 insertions(+), 8 deletions(-)
+ create mode 100755 tools/ws-bridge/run-dedicated-browser.sh
+
+diff --git a/Makefile b/Makefile
+index 7c9cb91f..9d5747d4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -75,7 +75,7 @@ ifeq ($(EMSCRIPTEN),1)
+     NET_LIBS  :=
+     EM_FS     ?= node
+ ifeq ($(EM_FS),browser)
+-    EM_FS_FLAGS := -sEXIT_RUNTIME=0 -lwebsocket.js
++    EM_FS_FLAGS := -sEXIT_RUNTIME=0 -lwebsocket.js "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','stringToUTF8']"
+ else ifeq ($(EM_FS),node-async)
+     EM_FS_FLAGS := -sASYNCIFY=1 -sASYNCIFY_IGNORE_INDIRECT=1 -sASYNCIFY_STACK_SIZE=4194304 -sNODERAWFS=1
+ else
+diff --git a/client/cl_main.c b/client/cl_main.c
+index b17c4af4..0943a77a 100644
+--- a/client/cl_main.c
++++ b/client/cl_main.c
+@@ -17,6 +17,9 @@
+ #else
+ #include <arpa/inet.h>
+ #endif
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ #include "client.h"
+ #include "cl_control_groups.h"
+ #include "cl_input_local.h"
+@@ -1212,6 +1215,15 @@ void CL_Init(void) {
+     CL_MenuCommand(Cvar_String("cl_start_menu", "menu_main"));
+ }
+ 
++#ifdef __EMSCRIPTEN__
++/* Test/automation hook: run a console/menu command from the page (the menu is
++ * driven by ordinary console commands). Used by headless UI tests; harmless in
++ * normal play. */
++EMSCRIPTEN_KEEPALIVE void WC3_DebugMenuCommand(const char *text) {
++    if (text && *text) Cmd_ExecuteString(text);
++}
++#endif
++
+ void CL_ConnectionlessPacket(netadr_t const *from, sizeBuf_t *msg) {
+     char payload[1024] = { 0 };
+     char command[256] = { 0 };
+@@ -1231,6 +1243,12 @@ void CL_ConnectionlessPacket(netadr_t const *from, sizeBuf_t *msg) {
+     if (!strcmp(command, "info")) {
+         info = strchr(payload, '\n');
+         if (from->type == NA_IP) CL_AddLANServer(from, info ? info + 1 : "");
++#ifdef __EMSCRIPTEN__
++        /* The WS bridge echoes the destination of our own broadcast "info"
++         * query back as the packet's from-address, so replies surface as
++         * NA_BROADCAST here instead of NA_IP. */
++        else if (from->type == NA_BROADCAST) CL_AddLANServer(from, info ? info + 1 : "");
++#endif
+         return;
+     }
+     if (strcmp(command, "client_connect")) {
+@@ -1420,10 +1438,16 @@ void CL_SendCmd(void) {
+ }
+ 
+ static void CL_CheckTimeout(void) {
++    uint32_t timeout_msec;
++
+     if (cls.state < ca_connected || cl_last_packet_time == 0) {
+         return;
+     }
+-    if (cl_realtime - cl_last_packet_time <= CL_TIMEOUT_MSEC) {
++    /* Server-side world loading is synchronous and can silence the link for a
++     * minute on cold real-data loads; a fixed 10s window disconnected clients
++     * mid-start. cl_timeout (seconds) bounds the silence instead. */
++    timeout_msec = (uint32_t)MAX(1, Cvar_Integer("cl_timeout", 120)) * 1000u;
++    if (cl_realtime - cl_last_packet_time <= timeout_msec) {
+         return;
+     }
+     CL_Disconnect("Connection to host timed out.", true);
+diff --git a/client/cl_parse.c b/client/cl_parse.c
+index ad59829e..a4a6a99c 100644
+--- a/client/cl_parse.c
++++ b/client/cl_parse.c
+@@ -945,6 +945,7 @@ static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+     state.game_speed = (uint32_t)MSG_ReadByte(msg);
+     slot_count = MSG_ReadByte(msg);
+     local_slot = MSG_ReadByte(msg);
++    state.is_host = MSG_ReadByte(msg) != 0;
+     state.revision = (uint32_t)MSG_ReadLong(msg);
+     if (slot_count < 0) {
+         slot_count = 0;
+@@ -954,7 +955,6 @@ static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+     }
+     state.slot_count = (uint32_t)slot_count;
+     state.local_slot = local_slot >= 0 && local_slot < MAX_PLAYERS ? (uint32_t)local_slot : MAX_PLAYERS;
+-    state.is_host = MSG_ReadByte(msg) != 0;
+     FOR_LOOP(i, state.slot_count) {
+         lobbySlot_t *slot = &state.slots[i];
+         int client;
+@@ -980,7 +980,6 @@ static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+             (unsigned)state.slot_count,
+             (unsigned)state.local_slot,
+             (unsigned)state.revision);
+-    fprintf(stderr, "CL_ParseLobbySetup: is_host=%d\n", state.is_host ? 1 : 0);
+     FOR_LOOP(i, state.slot_count) {
+         lobbySlot_t const *slot = &state.slots[i];
+ 
+diff --git a/common/cvar.c b/common/cvar.c
+index 75eb3d89..2145e8ff 100644
+--- a/common/cvar.c
++++ b/common/cvar.c
+@@ -559,6 +559,7 @@ void Cvar_Init(void) {
+     Cvar_GetD("sv_cheats",        "0",                 0,            "enable cheat commands on this server");
+     Cvar_GetD("sv_rate",          "0",                 0,            "UDP client link in bytes/second; snapshots due while it drains are skipped; 0=unlimited");
+     Cvar_GetD("dedicated",        "0",                 0,            "dedicated server mode (no client)");
++    Cvar_GetD("cl_timeout",       "120",               CVAR_ARCHIVE, "seconds of server silence before the client disconnects");
+     Cvar_GetD("com_frame_limit",  "0",                 0,            "exit after N main-loop iterations; 0=disabled");
+ #ifdef WC3
+     Cvar_GetD("com_maxfps",       "64",                CVAR_ARCHIVE, "maximum client frame rate; 0=unlimited");
+diff --git a/common/net.c b/common/net.c
+index 9de0ae7a..461d5e02 100644
+--- a/common/net.c
++++ b/common/net.c
+@@ -120,6 +120,14 @@ static EM_BOOL NET_WS_OnMessage(int eventType, EmscriptenWebSocketMessageEvent c
+ 
+ static void NET_WS_Open(cstring_t url) {
+     EmscriptenWebSocketCreateAttributes attr;
++
++    /* One bridge socket per client: the engine re-runs NET_OpenIP whenever the
++     * client transport is configured (e.g. each LAN refresh), and reopening
++     * would orphan the live socket and send through a CONNECTING one (the
++     * emscripten glue throws InvalidStateError on send, which surfaces as an
++     * uncaught page error and kills presentation). */
++    if (NET_WS_Active()) return;
++    net_ws_opened = false;
+     emscripten_websocket_init_create_attributes(&attr);
+     attr.url = url;
+     net_ws_socket = emscripten_websocket_new(&attr);
+diff --git a/server/sv_lobby.c b/server/sv_lobby.c
+index 024de50f..7e2ea70a 100644
+--- a/server/sv_lobby.c
++++ b/server/sv_lobby.c
+@@ -290,12 +290,20 @@ void SV_LobbyInit(cstring_t mapFilename) {
+ }
+ 
+ bool SV_LobbyClientIsHost(client_t *client) {
++    /* Dedicated servers keep an internal loopback client from their boot map;
++     * it is not a player and must not consume the lobby host role. */
++    bool const dedicated = Cvar_Integer("dedicated", 0) != 0;
++
+     FOR_LOOP(i, svs.num_clients) {
+         client_t *cl = &svs.clients[i];
+ 
+-        if (cl->state == cs_connected || cl->state == cs_spawned) {
+-            return cl == client;
++        if (cl->state != cs_connected && cl->state != cs_spawned) {
++            continue;
++        }
++        if (dedicated && cl->netchan.remote_address.type == NA_LOOPBACK) {
++            continue;
+         }
++        return cl == client;
+     }
+     return false;
+ }
+diff --git a/tools/ws-bridge/bridge.mjs b/tools/ws-bridge/bridge.mjs
+index 475a1c9e..31ecc217 100644
+--- a/tools/ws-bridge/bridge.mjs
++++ b/tools/ws-bridge/bridge.mjs
+@@ -18,6 +18,7 @@ function arg(name, fallback) {
+   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
+ }
+ const listenPort = parseInt(arg("listen", "8790"), 10);
++const listenHost = arg("host", "127.0.0.1");
+ const target = arg("target", "127.0.0.1:27960");
+ const [targetHost, targetPortStr] = target.split(":");
+ const targetPort = parseInt(targetPortStr, 10);
+@@ -25,8 +26,8 @@ const verbose = args.includes("--verbose");
+ 
+ let totalClients = 0;
+ 
+-const wss = new WebSocketServer({ host: "127.0.0.1", port: listenPort });
+-console.log(`[bridge] listening ws://127.0.0.1:${listenPort} -> udp ${targetHost}:${targetPort}`);
++const wss = new WebSocketServer({ host: listenHost, port: listenPort });
++console.log(`[bridge] listening ws://${listenHost}:${listenPort} -> udp ${targetHost}:${targetPort}`);
+ 
+ wss.on("connection", (ws, req) => {
+   const id = ++totalClients;
+diff --git a/tools/ws-bridge/run-dedicated-browser.sh b/tools/ws-bridge/run-dedicated-browser.sh
+new file mode 100755
+index 00000000..e0e1b952
+--- /dev/null
++++ b/tools/ws-bridge/run-dedicated-browser.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# Dedicated lobby for the browser-host start test: real data, bootybay,
++# NO timer startmatch - the browser lobby host presses Start.
++# Config FIRST (slot_count gates the slot commands), then the slot block.
++{
++  sleep 75
++  echo 'lobby_start Maps/(2)bootybay.w3m'
++  echo 'lobby_config 2 12 Maps/(2)bootybay.w3m'
++  sleep 2
++  while IFS= read -r wc3line; do
++    echo "$wc3line"
++    sleep 0.5
++  done <<'SLOTS'
++lobby_slot 1 1 1 0 0 1 1 Open
++lobby_slot 2 1 2 0 0 1 2 Open
++lobby_slot 3 1 3 0 0 1 3 Open
++lobby_slot 4 1 4 0 0 1 4 Open
++lobby_slot 5 1 5 0 0 1 5 Open
++lobby_slot 6 1 6 0 0 1 6 Open
++lobby_slot 7 1 7 0 0 1 7 Open
++lobby_slot 8 1 8 0 0 1 8 Open
++lobby_slot 9 1 9 0 0 1 9 Open
++lobby_slot 10 1 10 0 0 1 10 Open
++lobby_slot 11 1 11 0 0 1 11 Open
++SLOTS
++  sleep 86400
++} | exec ./build/bin/openwarcraft3 -data /src/gamedata/engine +dedicated 1 +game_port 27960 +map 'Maps/(2)bootybay.w3m'
+-- 
+2.47.3
+

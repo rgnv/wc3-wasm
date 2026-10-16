@@ -1,0 +1,16 @@
+# fetched / generated trees — never committed
+open-realm/
+third_party/
+data-www/
+emsdk-cache/
+node_modules/
+__pycache__/
+*.log
+
+# built client dropped into web/ by build-wasm.sh (source-only repo)
+web/openwarcraft3.js
+web/openwarcraft3.wasm
+web/openwarcraft3.data
+web/version.json
+web/movies/
+dist/

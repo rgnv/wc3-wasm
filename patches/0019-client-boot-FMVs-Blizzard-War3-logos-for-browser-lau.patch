@@ -1,0 +1,86 @@
+From f1c5fec94276a01dda0b76ea14471cb450b8e689 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:02:06 -0700
+Subject: [PATCH 19/29] client: boot FMVs (Blizzard -> War3 logos) for browser
+ launch parity
+
+Play the two boot logos before the menu on start, matching a normal
+client launch; WC3_MovieDone advances the stage and any input skips.
+Also normalize the wasm64 EM_JS pointer arg (BigInt) before UTF8
+decoding in wc3_page_play_movie.
+---
+ client/cl_movie.c | 23 ++++++++++++++++++++++-
+ client/client.h   |  3 +++
+ common/main.c     |  5 +++++
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/client/cl_movie.c b/client/cl_movie.c
+index b51f8794..2860388d 100644
+--- a/client/cl_movie.c
++++ b/client/cl_movie.c
+@@ -482,10 +482,31 @@ void CL_MovieShutdown(void) {
+ #ifdef __EMSCRIPTEN__
+ #include <emscripten.h>
+ EM_JS(void, wc3_page_play_movie, (const char *path), {
+-    if (Module.wc3PlayMovie) Module.wc3PlayMovie(UTF8ToString(path));
++    /* wasm64: pointer args arrive as BigInt — normalize before UTF8 decoding. */
++    if (Module.wc3PlayMovie) Module.wc3PlayMovie(UTF8ToString(Number(path)));
+ });
++static int cl_boot_logo_stage = -1;   /* -1 idle, 0 blizzardlogo, 1 war3logo */
++
++/* Normal-launch parity: play the Blizzard and War3 logo films before the menu
++ * is shown (retail boot order).  Skipping advances to the next logo, matching
++ * the retail skip behavior. */
++void CL_MovieBootLogos(void) {
++    if (cl_boot_logo_stage < 0) {
++        cl_boot_logo_stage = 0;
++        CL_PlayMovie("Movies\\blizzardlogo");
++    }
++}
++
+ EMSCRIPTEN_KEEPALIVE void WC3_MovieDone(void) {
+     cl_movie.active = false;
++    if (cl_boot_logo_stage == 0) {
++        cl_boot_logo_stage = 1;
++        CL_PlayMovie("Movies\\war3logo");
++        return;
++    }
++    if (cl_boot_logo_stage == 1) {
++        cl_boot_logo_stage = -1;
++    }
+ }
+ #endif
+ 
+diff --git a/client/client.h b/client/client.h
+index 75d6c512..4372e70c 100644
+--- a/client/client.h
++++ b/client/client.h
+@@ -183,6 +183,9 @@ void CL_MusicResumeFromSuspend(void);
+ 
+ /* Optional full-screen movie playback (client/cl_movie.c). */
+ void CL_MovieInit(void);
++#ifdef __EMSCRIPTEN__
++void CL_MovieBootLogos(void);
++#endif
+ void CL_Movie_f(void);
+ void CL_QueueMovie(cstring_t path);
+ void CL_QueueModelCinematic(cstring_t path);
+diff --git a/common/main.c b/common/main.c
+index 9eb531e4..acc855fc 100644
+--- a/common/main.c
++++ b/common/main.c
+@@ -538,6 +538,11 @@ int main(int argc, string_t argv[]) {
+     } else {
+         SV_Init();
+         CL_Init();
++#ifdef __EMSCRIPTEN__
++        /* Browser boot parity with a normal launch: Blizzard + War3 logo films
++         * play over the menu before it takes over (FMVs own by the page). */
++        CL_MovieBootLogos();
++#endif
+         if (load_map_from_save) {
+             CL_BeginLoadingMap(map);
+             SV_Map(map);
+-- 
+2.47.3
+

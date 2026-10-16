@@ -1,0 +1,26 @@
+From 51881ef0a89765a4a72bd791209da6cf47f955eb Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:22:38 -0700
+Subject: [PATCH 05/29] wasm: NODERAWFS for node smoke runs
+
+- the headless test binary reads the fixture data dir from the real filesystem under node (emscripten virtual MEMFS otherwise has no /src paths); browser packaging will switch to MEMFS/IDBFS in a later build variant
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index c6d7a0e9..7011c2c9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -73,7 +73,7 @@ ifeq ($(EMSCRIPTEN),1)
+     LDFLAGS   := -L$(LIB_DIR) -Wl,--allow-multiple-definition
+     LIBS      :=
+     NET_LIBS  :=
+-    CFLAGS    += -sMEMORY64=1 -sSTACK_SIZE=8388608 -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1
++    CFLAGS    += -sMEMORY64=1 -sSTACK_SIZE=8388608 -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1 -sNODERAWFS=1
+     AR        := $(shell command -v llvm-ar 2>/dev/null || command -v ar)
+ else ifeq ($(OS),Windows_NT)
+ 	ifeq ($(GL_BACKEND),gles3)
+-- 
+2.47.3
+

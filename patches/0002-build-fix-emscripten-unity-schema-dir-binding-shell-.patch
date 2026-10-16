@@ -1,0 +1,41 @@
+From 2ecb387f58188ee0982ab27007e4617238ea7ba9 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:05:52 -0700
+Subject: [PATCH 02/29] build: fix emscripten unity schema (dir binding + shell
+ var escaping)
+
+- unity pipe: single-$ $(4) bakes the module dir at call time (match native recipe); the deferred $$(4) form expands empty at recipe time and unity listed the whole tree
+- shell ${var##*/}/$var sigils inside eval-generated recipes need $$$$ escaping (two make expansion passes)
+---
+ Makefile | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 1ccbf848..e87104ff 100644
+--- a/Makefile
++++ b/Makefile
+@@ -223,10 +223,10 @@ ifeq ($(EMSCRIPTEN),1)
+ define unity_lib_schema
+ $(1): $(2) $$(SERVER_HEADERS) | $$(LIB_DIR)
+ 	@echo "[$(3)]"
+-	@$$(call UNITY,$$(4),$(5)) | \
++	@$$(call UNITY,$(4),$(5)) | \
+ 		$$(CC) $(6) -x c -c -o $(basename $(1)).o -
+ 	@for extra in $(7); do \
+-		$$(CC) $(6) -c -o "$(LIB_DIR)/obj-$(3)-$${extra##*/}.o" "$$extra" || exit 1; \
++		$$(CC) $(6) -c -o "$(LIB_DIR)/obj-$(3)-$$$${extra##*/}.o" "$$$$extra" || exit 1; \
+ 	done
+ 	@$$(AR) rcs $$@ $(basename $(1)).o $(foreach e,$(7),$(LIB_DIR)/obj-$(3)-$(notdir $e).o)
+ endef
+@@ -235,7 +235,7 @@ define src_lib_schema
+ $(1): $(2) $$(SERVER_HEADERS) | $$(LIB_DIR)
+ 	@echo "[$(3)]"
+ 	@for f in $(5); do \
+-		$$(CC) $(4) -c -o "$(LIB_DIR)/obj-$(3)-$${f##*/}.o" "$$f" || exit 1; \
++		$$(CC) $(4) -c -o "$(LIB_DIR)/obj-$(3)-$$$${f##*/}.o" "$$$$f" || exit 1; \
+ 	done
+ 	@$$(AR) rcs $$@ $(foreach f,$(5),$(LIB_DIR)/obj-$(3)-$(notdir $f).o)
+ endef
+-- 
+2.47.3
+

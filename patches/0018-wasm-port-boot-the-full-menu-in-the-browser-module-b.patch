@@ -1,0 +1,242 @@
+From f762d2ccc716fc6b1e210f4cb10d7aacd788474e Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 12:16:49 -0700
+Subject: [PATCH 18/29] wasm-port: boot the full menu in the browser
+ (module-boundary namespacing + client-only boot fallbacks)
+
+The single-image wasm link resolved the menu's FDF parser calls into the game
+module's copies of the shared UI surface.  Those copies talk to the game import
+table (gi), which is unfilled during a client-only boot, so the first
+GlobalStrings.fdf load hung inside a gi-backed read/alloc.  Desktop builds never
+saw this: the ELF visibility boundary keeps each module's copies private.
+
+- game.mk: namespace the game module's FDF/UI surface under emscripten
+  (~140 symbols: the parser machinery incl. macro-generated frame parsers, the
+  host services, and the theme accessors all move behind W3G_/UI_Game_ names).
+- hud.c / hud_write.c: gi-backed FDF host services fall back to engine-level
+  reads/allocs when the import table is not filled yet; texture/model loads
+  no-op instead of jumping through a null gi table.
+- menu_main.c: the browser menu FDF batch is no longer deferred -- the wedge it
+  worked around is fixed by the namespacing.
+- stb_fdf.h: MAX_UI_CLASSES 2048 -> 8192 (one shared frame table across modules
+  in the wasm image; the full menu batch exceeds the old cap).
+- cl_movie.c: browser movie playback -- the page owns decoding (fullscreen
+  <video> overlay); WC3_MovieDone resumes the engine.
+- cl_input.c: pointer-capture handling for the emscripten input path.
+---
+ client/cl_input.c                     |  5 ++++
+ client/cl_movie.c                     | 21 ++++++++++++++-
+ games/warcraft-3/common/stb_fdf.h     |  2 +-
+ games/warcraft-3/game.mk              | 19 ++++++++++++--
+ games/warcraft-3/game/hud/hud.c       | 37 +++++++++++++++++++++------
+ games/warcraft-3/game/hud/hud_write.c |  4 +++
+ games/warcraft-3/menu/menu_main.c     |  7 -----
+ 7 files changed, 76 insertions(+), 19 deletions(-)
+
+diff --git a/client/cl_input.c b/client/cl_input.c
+index feda9342..005c8b50 100644
+--- a/client/cl_input.c
++++ b/client/cl_input.c
+@@ -83,7 +83,12 @@ static bool CL_ClickTravel(vec2_t delta) {
+ static void IN_LookDown(void) {
+     if (!CL_GameplayInputReady() || CL_MouseOverGameplayUI()) return;
+     input.look = true; input.travel = (vec2_t){0};
++#ifndef __EMSCRIPTEN__
++    /* Browser builds: SDL relative mode maps to pointer lock, which hijacks the
++     * cursor; mousemove still reports xrel/yrel without it, so the drag-look
++     * works unlocked and the cursor stays visible. */
+     SDL_SetRelativeMouseMode(SDL_TRUE);
++#endif
+ }
+ 
+ /* Config can attach a game command to a look-button click without coupling the camera to that game. */
+diff --git a/client/cl_movie.c b/client/cl_movie.c
+index a044ad8c..b51f8794 100644
+--- a/client/cl_movie.c
++++ b/client/cl_movie.c
+@@ -479,8 +479,27 @@ void CL_MovieShutdown(void) {
+     CL_MovieCancel();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++EM_JS(void, wc3_page_play_movie, (const char *path), {
++    if (Module.wc3PlayMovie) Module.wc3PlayMovie(UTF8ToString(path));
++});
++EMSCRIPTEN_KEEPALIVE void WC3_MovieDone(void) {
++    cl_movie.active = false;
++}
++#endif
++
+ bool CL_PlayMovie(cstring_t path) {
+-#ifndef BZ_FFMPEG
++#ifdef __EMSCRIPTEN__
++    /* Browser: the page owns decoding (a fullscreen <video> overlay); the engine
++     * keeps the movie-active gate until WC3_MovieDone comes back from the page. */
++    if (!path || !*path) return false;
++    memset(&cl_movie, 0, sizeof(cl_movie));
++    snprintf(cl_movie.source_path, sizeof(cl_movie.source_path), "%s", path);
++    cl_movie.active = true;
++    wc3_page_play_movie(path);
++    return true;
++#elif !defined(BZ_FFMPEG)
+     CON_printf("Skipping movie %s: playback is disabled in this build (rebuild with FFMPEG=1).", path ? path : "");
+     return false;
+ #else
+diff --git a/games/warcraft-3/common/stb_fdf.h b/games/warcraft-3/common/stb_fdf.h
+index d982566c..9a5e6375 100644
+--- a/games/warcraft-3/common/stb_fdf.h
++++ b/games/warcraft-3/common/stb_fdf.h
+@@ -24,7 +24,7 @@
+ /* -------------------------------------------------------------------------- */
+ #define MAX_BUILD_QUEUE 7
+ #ifndef MAX_UI_CLASSES
+-#define MAX_UI_CLASSES 2048 // frames per module; measured peak is 1167, leaving 75% headroom
++#define MAX_UI_CLASSES 8192 // frames; the wasm single image shares one frame table across modules and the full menu batch can exceed the old 2048 cap
+ #endif
+ #include "ui_constants.h"
+ #define UI_MAX_MAP_LIST_ITEMS 1024
+diff --git a/games/warcraft-3/game.mk b/games/warcraft-3/game.mk
+index bae32e14..5715719c 100644
+--- a/games/warcraft-3/game.mk
++++ b/games/warcraft-3/game.mk
+@@ -132,8 +132,23 @@ WC3_FDF_CFLAGS := $(WC3_CFLAGS) -DSTB_FDF_IMPLEMENTATION -DSTB_FDF_GLOBALS
+ # engine-side copies under emscripten.
+ ifeq ($(EMSCRIPTEN),1)
+ WC3_APP_WORLD_CFLAGS := -DCM_SetupPathMap=CM_CL_SetupPathMap -DCM_GetPathingFlagsAt=CM_CL_GetPathingFlagsAt
++# Same single-image collision class for the UI host services: the menu module and
++# the game module each implement UI_Fdf*/UI_Load*/Theme_* against their own import
++# table (mi. vs gi.).  With hidden visibility the ELF boundary keeps them apart on
++# desktop; the wasm single image resolves the app's FDF parser calls to the FIRST
++# linked definition (-lgame), silently routing menu FDF loads into gi.ReadFile,
++# which is unfilled during a client-only boot.  Namespace the game-side copies.
++WC3_GAME_HOST_RENAMES := -DUI_EnsureFDF=UI_Game_EnsureFDF -DUI_ParseFDF=UI_Game_ParseFDF -DUI_ParseFDF_Buffer=UI_Game_ParseFDF_Buffer \
++    -DUI_FdfReadFile=UI_Game_FdfReadFile -DUI_FdfFreeFile=UI_Game_FdfFreeFile \
++    -DUI_FdfAlloc=UI_Game_FdfAlloc -DUI_FdfFree=UI_Game_FdfFree -DUI_FdfFontIndex=UI_Game_FdfFontIndex \
++    -DUI_LoadModel=UI_Game_LoadModel -DUI_LoadTexture=UI_Game_LoadTexture \
++    -DUI_WireFrameTypeFunctions=UI_Game_WireFrameTypeFunctions -DUI_ClearTheme=UI_Game_ClearTheme \
++    -DUI_ClearTextures=UI_Game_ClearTextures -DTheme_String=Game_Theme_String -DTheme_Float=Game_Theme_Float \
++    -Dparser_skip_ws=W3G_parser_skip_ws -Dparser_rtrim=W3G_parser_rtrim -Dparse_token=W3G_parse_token -Dpeek_token=W3G_peek_token -Deat_token=W3G_eat_token -Dparse_segment=W3G_parse_segment -Dparse_segment2=W3G_parse_segment2 -Dparser_error=W3G_parser_error -Dfind_in_array=W3G_find_in_array -DUI_FrameNameEquals=W3G_UI_FrameNameEquals -DUI_IsButtonFrameType=W3G_UI_IsButtonFrameType -DUI_IsCheckBoxFrameType=W3G_UI_IsCheckBoxFrameType -DUI_DecodeFramePointY=W3G_UI_DecodeFramePointY -DUI_FindFrame=W3G_UI_FindFrame -DUI_FindFrameByNumber=W3G_UI_FindFrameByNumber -DUI_FindChildFrame=W3G_UI_FindChildFrame -DUI_FindChildFrameType=W3G_UI_FindChildFrameType -DUI_FindFrameNear=W3G_UI_FindFrameNear -DUI_InitFrame=W3G_UI_InitFrame -DUI_ApplyFramePoints=W3G_UI_ApplyFramePoints -DUI_SetPoint=W3G_UI_SetPoint -DUI_SetAllPoints=W3G_UI_SetAllPoints -DUI_SetParent=W3G_UI_SetParent -DUI_SetSize=W3G_UI_SetSize -DUI_SetEnabled=W3G_UI_SetEnabled -DUI_SetHidden=W3G_UI_SetHidden -DUI_SetOnClick=W3G_UI_SetOnClick -DUI_IsEmbeddedControlPart=W3G_UI_IsEmbeddedControlPart -DUI_IsEmbeddedControlArtPart=W3G_UI_IsEmbeddedControlArtPart -DUI_CollectFrameTreeRecursiveEx=W3G_UI_CollectFrameTreeRecursiveEx -DUI_CollectFrameTree=W3G_UI_CollectFrameTree -DUI_MenuClearItems=W3G_UI_MenuClearItems -DUI_MenuAddItem=W3G_UI_MenuAddItem -DUI_ClearTemplates=W3G_UI_ClearTemplates -DUI_SetCameraEventRelease=W3G_UI_SetCameraEventRelease -DUI_Spawn=W3G_UI_Spawn -DUI_ReleaseFrame=W3G_UI_ReleaseFrame -DUI_FreeFrameTree=W3G_UI_FreeFrameTree -DFDF_ParseEnumString=W3G_FDF_ParseEnumString -DUI_Trim=W3G_UI_Trim -DUI_RemoveBom=W3G_UI_RemoveBom -DUI_CopyDisplayString=W3G_UI_CopyDisplayString -DUI_FreeFrameDynamicText=W3G_UI_FreeFrameDynamicText -DUI_FreeFrameMenuItems=W3G_UI_FreeFrameMenuItems -DUI_FixCopiedFrameMenuItems=W3G_UI_FixCopiedFrameMenuItems -DUI_SetFrameDisplayString=W3G_UI_SetFrameDisplayString -DUI_FixCopiedFrameTextPointer=W3G_UI_FixCopiedFrameTextPointer -DFDF_ParseFloatList=W3G_FDF_ParseFloatList -DUI_ClearStringList=W3G_UI_ClearStringList -DUI_AddStringListItem=W3G_UI_AddStringListItem -Dparse_item=W3G_parse_item -Dparse_func=W3G_parse_func -DFindFrameTemplate=W3G_FindFrameTemplate -DUI_FrameTypesCompatible=W3G_UI_FrameTypesCompatible -DUI_InheritFrom=W3G_UI_InheritFrom -DFDF_ParseFrame=W3G_FDF_ParseFrame -DUI_RemapClonedFrame=W3G_UI_RemapClonedFrame -DUI_RemapClonedPoint=W3G_UI_RemapClonedPoint -DUI_RemapClonedFramePointers=W3G_UI_RemapClonedFramePointers -DUI_CloneFrameTree=W3G_UI_CloneFrameTree -DUI_CloneTemplateChildren=W3G_UI_CloneTemplateChildren -DFDF_ParseScene=W3G_FDF_ParseScene -DUI_FDFLoaded=W3G_UI_FDFLoaded -DUI_MarkFDFLoaded=W3G_UI_MarkFDFLoaded -DUI_SetText=W3G_UI_SetText -DUI_SetTextPointer=W3G_UI_SetTextPointer -DUI_GetString=W3G_UI_GetString -DUI_SetTexture=W3G_UI_SetTexture -DUI_SetTexture2=W3G_UI_SetTexture2 \
++    -DFDF_ParseButtonText=W3G_FDF_ParseButtonText -DFDF_ParseColor=W3G_FDF_ParseColor -DFDF_ParseFloat=W3G_FDF_ParseFloat -DFDF_ParseFramePtr=W3G_FDF_ParseFramePtr -DFDF_ParseInteger=W3G_FDF_ParseInteger -DFDF_ParseModelPath=W3G_FDF_ParseModelPath -DFDF_ParseName=W3G_FDF_ParseName -DFDF_ParseText=W3G_FDF_ParseText -DFDF_ParseTextureFile=W3G_FDF_ParseTextureFile -DFDF_ParseVector2=W3G_FDF_ParseVector2 -DFDF_ParseVector3=W3G_FDF_ParseVector3 -DFDF_ParseVector4=W3G_FDF_ParseVector4 -DFDF_ParseAlphaMode=W3G_FDF_ParseAlphaMode -DFDF_ParseFontFlags=W3G_FDF_ParseFontFlags -DFDF_ParseFontJustificationH=W3G_FDF_ParseFontJustificationH -DFDF_ParseFontJustificationV=W3G_FDF_ParseFontJustificationV -DFDF_ParseFramePointType=W3G_FDF_ParseFramePointType -DFDF_ParseHighlightType=W3G_FDF_ParseHighlightType -DFDF_ParseControlStyle=W3G_FDF_ParseControlStyle -DFDF_ParseCornerFlags=W3G_FDF_ParseCornerFlags -DAnchor=W3G_Anchor -DBackdropBlendAll=W3G_BackdropBlendAll -DBackdropHalfSides=W3G_BackdropHalfSides -DBackdropMirrored=W3G_BackdropMirrored -DBackdropTileBackground=W3G_BackdropTileBackground -DDecorateFileNames=W3G_DecorateFileNames -DEditHighlightInitial=W3G_EditHighlightInitial -DEditSetFocus=W3G_EditSetFocus -DFont=W3G_Font -DFrame=W3G_Frame -DIncludeFile=W3G_IncludeFile -DLayer=W3G_Layer -DMenuItem=W3G_MenuItem -DSetAllPoints=W3G_SetAllPoints -DSetPoint=W3G_SetPoint -DSliderLayoutHorizontal=W3G_SliderLayoutHorizontal -DSliderLayoutVertical=W3G_SliderLayoutVertical -DString=W3G_String -DStringList=W3G_StringList -DTabFocusDefault=W3G_TabFocusDefault -DTabFocusPush=W3G_TabFocusPush -DTexture=W3G_Texture -DUseActiveContext=W3G_UseActiveContext
+ else
+ WC3_APP_WORLD_CFLAGS :=
++WC3_GAME_HOST_RENAMES :=
+ endif
+ WC3_COMMON_SRCS := $(shell find $(WC3_DIR)/common -name '*.c' 2>/dev/null | sort)
+ MENU_HEADERS := $(shell find $(WC3_DIR)/menu -name '*.h' | sort) client/menu.h
+@@ -237,7 +252,7 @@ JASS_HEADERS := $(COMMON_HEADERS) $(CLIENT_HEADERS) $(shell find $(WC3_GAME_DIR)
+ $(eval $(call unity_lib_schema,$(JASS_LIB),$(SHARED_LIB) $(JASS_HEADERS) $(shell find $(WC3_JASS_DIR) -name '*.c' -o -name '*.h'),jass,$(WC3_JASS_DIR),,$(WC3_CFLAGS),,-lshared -lm))
+ $(eval $(call src_lib_schema,$(SHEET_LIB),$(WC3_SHEET_DIR)/parser.c $(WC3_SHEET_DIR)/sheet.c common/common.h,sheet,$(CFLAGS),$(WC3_SHEET_DIR)/parser.c $(WC3_SHEET_DIR)/sheet.c,))
+ $(eval $(call unity_lib_schema,$(RENDERER_LIB),$(RENDERER_BASE_DEPS) $(SHEET_LIB) $(call CSRC,renderer $(WC3_DIR)/renderer),renderer,renderer $(WC3_DIR)/renderer,,$(WC3_CFLAGS),common/mpq.c,$(RENDERER_SHARED_LIBS) -lsheet))
+-$(eval $(call unity_lib_schema,$(GAME_LIB),$(GAME_BASE_DEPS) $(JASS_LIB) $(SHEET_LIB) $(WORLD_CORE_SRCS) $(WC3_COMMON_SRCS) $(call CSRC,$(WC3_GAME_DIR)),game,$(WC3_GAME_DIR) $(WC3_DIR)/common,! -name 'world_w3.c',$(WC3_FDF_CFLAGS),common/mpq.c,-lsheet -lshared -ljass $(LIBS) -lm -lz))
++$(eval $(call unity_lib_schema,$(GAME_LIB),$(GAME_BASE_DEPS) $(JASS_LIB) $(SHEET_LIB) $(WORLD_CORE_SRCS) $(WC3_COMMON_SRCS) $(call CSRC,$(WC3_GAME_DIR)),game,$(WC3_GAME_DIR) $(WC3_DIR)/common,! -name 'world_w3.c',$(WC3_FDF_CFLAGS) $(WC3_GAME_HOST_RENAMES),common/mpq.c,-lsheet -lshared -ljass $(LIBS) -lm -lz))
+ $(eval $(call unity_lib_schema,$(MENU_LIB),$(UI_BASE_DEPS) $(MENU_HEADERS) common/mpq.c common/mpq.h $(WC3_COMMON_SRCS) $(call CSRC,$(WC3_DIR)/menu),menu,$(WC3_DIR)/menu $(WC3_DIR)/common,! -name 'world_w3.c',$(WC3_FDF_CFLAGS),common/mpq.c,-lshared -lsheet -lm -lz))
+ # The remote client loads collision data before any game imports exist; compile its format reader into the engine.
+ $(eval $(call app_schema,$(BINARY),$(SHARED_LIB) $(JASS_LIB) $(SHEET_LIB) $(GAME_LIB) $(RENDERER_LIB) $(MENU_LIB) $(WC3_EOS_RUNTIME) $(EOS_BUILD_CONFIG) $(APP_SRCS) $(WC3_COMMON_SRCS) $(CLIENT_HEADERS) $(COMMON_HEADERS),openwarcraft3,$(WC3_FDF_CFLAGS) $(WC3_EOS_CFLAGS) -DBZ_CLIENT_WORLD $(WC3_APP_WORLD_CFLAGS),-lsheet -lshared -ljass -lgame -lrenderer -lmenu $(LIBS) $(WC3_FFMPEG_LIBS) $(WC3_EOS_LIBS) -lz,$(WC3_DIR)/common/world_w3.c))
+@@ -257,7 +272,7 @@ GAME_WC3_TEST_LIB := $(LIB_DIR)/libgame-wc3-test$(LIB_EXT)
+ WC3_TEST_BINARY   := $(BIN_DIR)/openwarcraft3-tests$(EXE_EXT)
+ $(WC3_TEST_BINARY): tests/online_acceptance.h $(WC3_TEST_DIR)/online_gameplay.h
+ 
+-$(eval $(call unity_lib_schema,$(GAME_WC3_TEST_LIB),$(GAME_BASE_DEPS) $(JASS_LIB) $(SHEET_LIB) $(WORLD_CORE_SRCS) $(WC3_COMMON_SRCS) $(call CSRC,$(WC3_GAME_DIR)),game-wc3-test,$(WC3_GAME_DIR) $(WC3_DIR)/common,! -name 'world_w3.c',$(WC3_FDF_CFLAGS) -DBZ_TESTS,common/mpq.c,-lsheet -lshared -ljass $(LIBS) -lm -lz))
++$(eval $(call unity_lib_schema,$(GAME_WC3_TEST_LIB),$(GAME_BASE_DEPS) $(JASS_LIB) $(SHEET_LIB) $(WORLD_CORE_SRCS) $(WC3_COMMON_SRCS) $(call CSRC,$(WC3_GAME_DIR)),game-wc3-test,$(WC3_GAME_DIR) $(WC3_DIR)/common,! -name 'world_w3.c',$(WC3_FDF_CFLAGS) -DBZ_TESTS $(WC3_GAME_HOST_RENAMES),common/mpq.c,-lsheet -lshared -ljass $(LIBS) -lm -lz))
+ $(eval $(call app_schema,$(WC3_TEST_BINARY),$(SHARED_LIB) $(JASS_LIB) $(SHEET_LIB) $(GAME_WC3_TEST_LIB) $(RENDERER_LIB) $(MENU_LIB) $(WC3_EOS_RUNTIME) $(EOS_BUILD_CONFIG) $(APP_SRCS) $(WC3_COMMON_SRCS) $(CLIENT_HEADERS) $(COMMON_HEADERS) $(WC3_TEST_DIR)/test_coordinates.c,openwarcraft3-tests,$(WC3_FDF_CFLAGS) $(WC3_EOS_CFLAGS) -DBZ_CLIENT_WORLD -DBZ_TESTS $(WC3_APP_WORLD_CFLAGS),-lsheet -lshared -ljass -lgame-wc3-test -lrenderer -lmenu $(LIBS) $(WC3_FFMPEG_LIBS) $(WC3_EOS_LIBS) -lz,$(WC3_DIR)/common/world_w3.c $(WC3_TEST_DIR)/test_coordinates.c))
+ 
+ openwarcraft3-tests: $(WC3_TEST_BINARY)
+diff --git a/games/warcraft-3/game/hud/hud.c b/games/warcraft-3/game/hud/hud.c
+index e360ad7a..123e20fa 100644
+--- a/games/warcraft-3/game/hud/hud.c
++++ b/games/warcraft-3/game/hud/hud.c
+@@ -852,15 +852,31 @@ void UI_LoadHud(void) {
+     UI_LoadHudLoading();
+ }
+ 
+-/* FDF host services — game module implementations using gi */
+-BZ_HOST_HIDDEN handle_t UI_FdfAlloc(long size) { return gi.MemAlloc(size); }
+-BZ_HOST_HIDDEN void UI_FdfFree(handle_t ptr) { gi.MemFree(ptr); }
++/* FDF host services — game module implementations using gi.  During a
++ * client-only boot (menu phase, no map) the gi table is unfilled, so fall
++ * back to the engine-level services directly — in the wasm single-image
++ * build every module shares one address space and the linker may bind the
++ * plain symbols here; the fallback keeps both contexts working. */
++BZ_HOST_HIDDEN handle_t UI_FdfAlloc(long size) {
++    if (gi.MemAlloc) return gi.MemAlloc(size);
++    return MemAlloc((size_t)size);
++}
++BZ_HOST_HIDDEN void UI_FdfFree(handle_t ptr) {
++    if (gi.MemFree) { gi.MemFree(ptr); return; }
++    MemFree(ptr);
++}
+ BZ_HOST_HIDDEN int UI_FdfReadFile(cstring_t name, handle_t *out) {
+-    uint32_t size = 0;
+-    *out = gi.ReadFile(name, &size);
+-    return *out ? (int)size : -1;
++    if (gi.ReadFile) {
++        uint32_t size = 0;
++        *out = gi.ReadFile(name, &size);
++        return *out ? (int)size : -1;
++    }
++    return FS_ReadFileQ3(name, (void **)out);
++}
++BZ_HOST_HIDDEN void UI_FdfFreeFile(handle_t buf) {
++    if (gi.MemFree) { gi.MemFree(buf); return; }
++    MemFree(buf);
+ }
+-BZ_HOST_HIDDEN void UI_FdfFreeFile(handle_t buf) { gi.MemFree(buf); }
+ 
+ /* Game module doesn't handle UI events or themes — stub these */
+ BZ_HOST_HIDDEN void UI_WireFrameTypeFunctions(frameDef_t *frame) { (void)frame; }
+@@ -868,5 +884,10 @@ BZ_HOST_HIDDEN void UI_ClearTheme(void) {}
+ 
+ /* Game module doesn't load 3D models for UI — stub */
+ BZ_HOST_HIDDEN uint32_t UI_LoadModel(cstring_t file, bool decorate) {
+-    return file && *file ? gi.ModelIndex(decorate ? Theme_PlayerString(NULL, file, file) : file) : 0;
++    if (!file || !*file) return 0;
++    if (!gi.ModelIndex) {
++        /* client-only boot (menu): the server-owned model table is not up yet. */
++        return 0;
++    }
++    return gi.ModelIndex(decorate ? Theme_PlayerString(NULL, file, file) : file);
+ }
+diff --git a/games/warcraft-3/game/hud/hud_write.c b/games/warcraft-3/game/hud/hud_write.c
+index 1d67890d..779ff285 100644
+--- a/games/warcraft-3/game/hud/hud_write.c
++++ b/games/warcraft-3/game/hud/hud_write.c
+@@ -429,6 +429,10 @@ BZ_HOST_HIDDEN uint32_t UI_LoadTexture(cstring_t path, bool decorate) {
+ 
+     if (!path || !*path) return 0;
+     if (UI_IsDeferredImageKey(path) && (index = UI_DeferredImage(path))) return index;
++    if (!gi.ImageIndex) {
++        /* client-only boot (menu): the server-owned image table is not up yet. */
++        return 0;
++    }
+ 
+     cstring_t resolved = UI_ThemeImagePath(path);
+     index = gi.ImageIndex(resolved);
+diff --git a/games/warcraft-3/menu/menu_main.c b/games/warcraft-3/menu/menu_main.c
+index c58db178..b1ddb447 100644
+--- a/games/warcraft-3/menu/menu_main.c
++++ b/games/warcraft-3/menu/menu_main.c
+@@ -357,12 +357,6 @@ void M_Init(void) {
+     
+     mi.Printf("M_Init: loading FDF assets\n");
+ 
+-#ifdef __EMSCRIPTEN__
+-    /* wasm port (open issue): the menu FDF batch wedges on its second cross-module
+-     * mi.FS_ReadFile call under the browser runtime (see project notes). Map launches
+-     * clear the menu and do not need these FDFs, so they are deferred for the browser
+-     * build pending a dedicated menu pass. */
+-#else
+     UI_LoadTheme("UI\\war3skins.txt");
+     UI_ParseFDF("UI\\FrameDef\\GlobalStrings.fdf");
+ 
+@@ -383,7 +377,6 @@ void M_Init(void) {
+     UI_ParseFDF("UI\\FrameDef\\Glue\\PlayerSlot.fdf");
+     UI_ParseFDF("UI\\FrameDef\\Glue\\GameChatroom.fdf");
+     
+-#endif
+     ui_state.initialized = true;
+     ui_state.active = true;
+     
+-- 
+2.47.3
+

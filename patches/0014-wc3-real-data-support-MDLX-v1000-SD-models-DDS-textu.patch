@@ -1,0 +1,448 @@
+From 729898704cc19cf7d8da2c048437222cdf62fdb5 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:28:51 -0700
+Subject: [PATCH 14/29] =?UTF-8?q?wc3:=20real-data=20support=20=E2=80=94=20?=
+ =?UTF-8?q?MDLX=20v1000=20SD=20models,=20DDS=20texture=20resolution,=20nul?=
+ =?UTF-8?q?l-model=20guards?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- MDLX_ReadVERS accepts 800/900/1000: every SD model in the modern CASC is
+  v1000 with the classic chunk layout (VERS/MODL/SEQS/MTLS/TEXS/GEOS/BONE/...).
+- R_ReadTextureFile: authored .blp/.tga/.tif and extensionless refs resolve as
+  .blp then .dds (modern data stores legacy-named images as DDS); .dds/.pcx
+  stay exact. Test contract extended in tests/test_renderer_model.c.
+- Null-model guards (R_RenderModel, MDX_RenderModel, MDLX_BindBoneMatrices):
+  a failed model load is a valid empty handle and used to segfault the menu
+  glue scene.
+- tools/casc/: CASC->MPQ data prep tools (wc3casc, wc3mpq) + build notes,
+  incl. the MPQ v1 4 GiB cap pitfall.
+
+Verified: full suite green; native real-asset boot (real 1.32.10 CASC set as
+war3.mpq/War3Local.mpq/tileset MPQs) renders the menu 3D scene for 70s+ with
+zero unsupported-model lines.
+---
+ games/warcraft-3/renderer/mdx/r_mdx_anim.c   |   1 +
+ games/warcraft-3/renderer/mdx/r_mdx_geoset.c |   2 +
+ games/warcraft-3/renderer/mdx/r_mdx_load.c   |   9 +-
+ games/warcraft-3/renderer/r_game.c           |   2 +-
+ renderer/r_texture.c                         |  21 ++-
+ tests/test_renderer_model.c                  |  13 +-
+ tools/casc/README.md                         |  41 ++++++
+ tools/casc/wc3casc.cpp                       | 146 +++++++++++++++++++
+ tools/casc/wc3mpq.cpp                        |  70 +++++++++
+ 9 files changed, 294 insertions(+), 11 deletions(-)
+ create mode 100644 tools/casc/README.md
+ create mode 100644 tools/casc/wc3casc.cpp
+ create mode 100644 tools/casc/wc3mpq.cpp
+
+diff --git a/games/warcraft-3/renderer/mdx/r_mdx_anim.c b/games/warcraft-3/renderer/mdx/r_mdx_anim.c
+index c66525c9..daad442b 100644
+--- a/games/warcraft-3/renderer/mdx/r_mdx_anim.c
++++ b/games/warcraft-3/renderer/mdx/r_mdx_anim.c
+@@ -298,6 +298,7 @@ void AddSkin(vec3_t *pos, mat4_t const *mat, vec3_t const *org, float weight) {
+ }
+ 
+ void MDLX_BindBoneMatrices(mdxModel_t const *model, mat4_t const *model_matrix, uint32_t frame1, uint32_t frame0) {
++    if (!model) return; /* failed model loads produce an empty handle */
+     /* Only the nodes this model actually has need their global matrices
+      * recomputed.  The old path memset the full 64KB node_matrices array and
+      * scanned all MDX_MAX_NODES slots twice; models have tens of nodes, so the
+diff --git a/games/warcraft-3/renderer/mdx/r_mdx_geoset.c b/games/warcraft-3/renderer/mdx/r_mdx_geoset.c
+index a45570ba..d4c1e7fe 100644
+--- a/games/warcraft-3/renderer/mdx/r_mdx_geoset.c
++++ b/games/warcraft-3/renderer/mdx/r_mdx_geoset.c
+@@ -792,6 +792,8 @@ void MDX_RenderModel(renderEntity_t const *entity,
+                      mdxModel_t const *model,
+                      mat4_t const *transform)
+ {
++    /* A model whose payload failed to load is a valid empty handle; skip it. */
++    if (!model) return;
+     if (!(tr.viewDef.rdflags & RDF_NOFRUSTUMCULL)) {
+         vec3_t const center = Box3_Center(&model->bounds.box);
+         sphere3_t const sphere = {
+diff --git a/games/warcraft-3/renderer/mdx/r_mdx_load.c b/games/warcraft-3/renderer/mdx/r_mdx_load.c
+index 00dadf9c..ad73d95c 100644
+--- a/games/warcraft-3/renderer/mdx/r_mdx_load.c
++++ b/games/warcraft-3/renderer/mdx/r_mdx_load.c
+@@ -583,12 +583,15 @@ blockReadCode_t MDLX_ReadMODL(sizeBuf_t *sb, mdxModel_t *model) {
+ }
+ 
+ blockReadCode_t MDLX_ReadVERS(sizeBuf_t *sb, mdxModel_t *model) {
+-    if ((model->version = MSG_ReadLong(sb)) != 800) {
++    model->version = MSG_ReadLong(sb);
++    /* 800 = RoC, 900 = TFT, 1000 = Reforged-era container. Modern SD game data
++     * ships every model as 1000 with the classic chunk layout, so accept all
++     * three; version-specific payload deltas are handled by the chunk readers. */
++    if (model->version != 800 && model->version != 900 && model->version != 1000) {
+         fprintf(stderr, "Usupported MDLX version %d\n", model->version);
+         return BLOCKREAD_ERROR;
+-    } else {
+-        return BLOCKREAD_OK;
+     }
++    return BLOCKREAD_OK;
+ }
+ 
+ blockReadCode_t MDLX_ReadEVTS(sizeBuf_t *sb, mdxModel_t *model) {
+diff --git a/games/warcraft-3/renderer/r_game.c b/games/warcraft-3/renderer/r_game.c
+index 8c39121b..fe68f5b9 100644
+--- a/games/warcraft-3/renderer/r_game.c
++++ b/games/warcraft-3/renderer/r_game.c
+@@ -2036,7 +2036,7 @@ void R_UpdateEntityPresentation(renderEntity_t const *entity) {
+ void R_RenderModel(renderEntity_t const *entity) {
+     mat4_t transform;
+ 
+-    if (!entity || !entity->model || entity->model->modeltype != ID_MDLX) {
++    if (!entity || !entity->model || entity->model->modeltype != ID_MDLX || !entity->model->mdx) {
+         return;
+     }
+     MDLX_TickDetachedRibbons(); /* fade trails whose entity stopped drawing before this model draws */
+diff --git a/renderer/r_texture.c b/renderer/r_texture.c
+index 49b0a154..1d6ed793 100644
+--- a/renderer/r_texture.c
++++ b/renderer/r_texture.c
+@@ -5,14 +5,29 @@
+ int R_ReadTextureFile(cstring_t name, string_t path, void **buffer) {
+     static cstring_t const exact[] = { ".blp", ".dds", ".pcx" };
+     cstring_t ext = strrchr(name, '.');
++    int len;
++    int size;
+     snprintf(path, sizeof(PATHSTR), "%s", name);
+-    int size = ri.FS_ReadFile(path, buffer);
++    size = ri.FS_ReadFile(path, buffer);
+     if (size >= 0 && *buffer) return size;
++    /* .dds/.pcx references match exactly and are not rewritten. Authored .blp,
++     * .tga and extensionless names may resolve as either .blp or .dds: modern
++     * WC3 data stores legacy-named images as DDS (previously only extensionless
++     * names found BLPs, leaving authored .tga references unresolved). */
++    if (ext && !strcasecmp(ext, ".blp")) {
++        /* Authored .blp: the exact read above already probed it; try the .dds store form. */
++        snprintf(path, sizeof(PATHSTR), "%.*s.dds", (int)(ext - name), name);
++        return ri.FS_ReadFile(path, buffer);
++    }
+     FOR_LOOP(i, sizeof(exact) / sizeof(exact[0]))
+         if (ext && !strcasecmp(ext, exact[i])) return size;
+-    /* Previously only extensionless names found BLPs, leaving authored .tga references unresolved. */
+-    int len = ext && !strcasecmp(ext, ".tga") ? (int)(ext - name) : (int)strlen(name);
++    len = ext && (!strcasecmp(ext, ".tga") || !strcasecmp(ext, ".tif"))
++              ? (int)(ext - name)
++              : (int)strlen(name);
+     snprintf(path, sizeof(PATHSTR), "%.*s.blp", len, name);
++    size = ri.FS_ReadFile(path, buffer);
++    if (size >= 0 && *buffer) return size;
++    snprintf(path, sizeof(PATHSTR), "%.*s.dds", len, name);
+     return ri.FS_ReadFile(path, buffer);
+ }
+ 
+diff --git a/tests/test_renderer_model.c b/tests/test_renderer_model.c
+index e6e2ec5e..a44c813e 100644
+--- a/tests/test_renderer_model.c
++++ b/tests/test_renderer_model.c
+@@ -1823,7 +1823,9 @@ TEST(renderer_stats, triangles_include_instanced_amplification) {
+     T_EQ(R_PrimitiveTriangles(GL_LINES, 12, 100), (uint64_t)0);
+ }
+ 
+-/* File lookup probes the exact reference first and only substitutes the supported BLP representation. */
++/* File lookup probes the exact reference first, then the supported store representations:
++ * authored .blp/.tga/extensionless names may resolve as .blp or .dds (modern WC3 data stores
++ * legacy-named images as DDS); .dds/.pcx references are exact. */
+ static cstring_t texture_file;
+ static uint32_t texture_reads;
+ static int test_texture_read(cstring_t name, void **buffer) {
+@@ -1839,11 +1841,14 @@ TEST(renderer_texture, authored_extensions_resolve_without_losing_real_files) {
+         { "Cliff0.tga", "Cliff0.tga", 1, true },
+         { "Tree", "Tree.blp", 2, true },
+         { "Tree.blp", "Tree.blp", 1, true },
+-        { "Missing.tga", "", 2, false },
+-        { "Missing.blp", "", 1, false },
++        { "White_mask.blp", "White_mask.dds", 2, true },
++        { "White_mask.tga", "White_mask.dds", 3, true },
++        { "Tree", "Tree.dds", 3, true },
++        { "Missing.tga", "", 3, false },
++        { "Missing.blp", "", 2, false },
+         { "Missing.dds", "", 1, false },
+         { "Missing.pcx", "", 1, false },
+-        { "Missing", "", 2, false },
++        { "Missing", "", 3, false },
+     };
+     int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+     ri.FS_ReadFile = test_texture_read;
+diff --git a/tools/casc/README.md b/tools/casc/README.md
+new file mode 100644
+index 00000000..da3a71a6
+--- /dev/null
++++ b/tools/casc/README.md
+@@ -0,0 +1,41 @@
++# WC3 CASC → MPQ data tools (rgnv fork, wasm-port)
++
++Prep tools for turning the modern WC3 CASC install into engine-readable MPQ sets.
++
++## Build
++
++```bash
++# deps (Debian): zlib1g-dev libtomcrypt-dev libtommath-dev libbz2-dev cmake g++
++git clone --depth 1 https://github.com/ladislav-zezula/CascLib.git
++git clone --depth 1 https://github.com/ladislav-zezula/StormLib.git
++# CascLib current master needs a one-line Linux fix: s/LPDWORD/PDWORD/ in src/CascFiles.cpp
++cmake -B CascLib/build -S CascLib -DCMAKE_BUILD_TYPE=Release && cmake --build CascLib/build -j
++cmake -B StormLib/build -S StormLib -DCMAKE_BUILD_TYPE=Release && cmake --build StormLib/build -j
++
++g++ -O2 -std=c++17 wc3casc.cpp -I CascLib/src  -L CascLib/build  -lcasc -o wc3casc
++g++ -O2 -std=c++17 wc3mpq.cpp  -I StormLib/src -L StormLib/build -lstorm -ltomcrypt -ltommath -lbz2 -lz -o wc3mpq
++```
++
++## wc3casc — read/extract from the CASC tree
++
++```
++wc3casc list <tree> [outListFile]           # enumerate (writes <size>	<name> lines)
++wc3casc extract <tree> <name> <outFile>
++wc3casc extract-list <tree> <nameFile> <outDir>   # batch; names mapped ':'/'' -> '/'
++```
++
++- `tree` = the install dir containing `.build.info` (your Warcraft III installation).
++- Names use the `war3.w3mod:<path>` virtual-prefix scheme (backslashes).
++- Classic SD set = plain `war3.w3mod:` root + `_locales\<lang>.w3mod:` + `_tilesets\<letter>.w3mod:`.
++
++## wc3mpq — bulk-pack an MPQ from a manifest
++
++```
++wc3mpq <archive.mpq> <manifest.tsv>          # lines: <src-path>	<archive-name>
++```
++
++- **PITFALL: MPQ v1 archives cap at 4 GiB.** Keep each archive under it (e.g. ship the
++  `movies/` tree as its own `War3Movies.mpq`; the engine mounts every `*.mpq` found in
++  the data dir, so splitting is free).
++- Engine archive contract: `war3.mpq` (+ `War3Local.mpq`), per-tileset `A..Z.mpq`
++  (uppercase letter = the map's tileset byte, `R_W3OpenTilesetArchive`).
+diff --git a/tools/casc/wc3casc.cpp b/tools/casc/wc3casc.cpp
+new file mode 100644
+index 00000000..5f74507d
+--- /dev/null
++++ b/tools/casc/wc3casc.cpp
+@@ -0,0 +1,146 @@
++// wc3casc — minimal CascLib CLI for extracting Warcraft III (Reforged) CASC storages.
++// modes:
++//   list        <storage> <outListFile>
++//   extract     <storage> <name> <outFile>
++//   extract-mask<storage> <mask> <outDir>       (names 'war3.mpq:a/b' -> outDir/war3.mpq/a/b)
++// Built against CascLib (ladislav-zezula), local build in ../CascLib/build.
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <string>
++#include <sys/stat.h>
++#include "CascLib.h"
++
++static void mkdirs(const std::string &path) {
++    std::string cur;
++    for (char c : path) {
++        cur += c;
++        if (c == '/') mkdir(cur.c_str(), 0755);
++    }
++    mkdir(path.c_str(), 0755);
++}
++
++static std::string nameToPath(const std::string &name) {
++    std::string out;
++    out.reserve(name.size());
++    for (char c : name) out += (c == ':' || c == '\\') ? '/' : c;
++    return out;
++}
++
++static bool writeFile(HANDLE storage, const char *name, const std::string &dest, unsigned long long *bytesOut) {
++    HANDLE f = NULL;
++    if (!CascOpenFile(storage, name, 0, CASC_OPEN_BY_NAME, &f)) return false;
++    size_t slash = dest.find_last_of('/');
++    if (slash != std::string::npos) mkdirs(dest.substr(0, slash));
++    FILE *out = fopen(dest.c_str(), "wb");
++    if (!out) { CascCloseFile(f); return false; }
++    char buf[0x10000];
++    DWORD got = 0;
++    unsigned long long total = 0;
++    for (;;) {
++        if (!CascReadFile(f, buf, sizeof(buf), &got) || got == 0) break;
++        fwrite(buf, 1, got, out);
++        total += got;
++    }
++    fclose(out);
++    CascCloseFile(f);
++    if (bytesOut) *bytesOut = total;
++    return true;
++}
++
++int main(int argc, char **argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage:\n  %s list <storage> [outListFile]\n  %s extract <storage> <name> <outFile>\n  %s extract-mask <storage> <mask> <outDir>\n",
++                argv[0], argv[0], argv[0]);
++        return 2;
++    }
++    const char *mode = argv[1];
++    HANDLE storage = NULL;
++    if (!CascOpenStorage(argv[2], 0, &storage)) {
++        fprintf(stderr, "CascOpenStorage(%s) failed: err=%u\n", argv[2], GetCascError());
++        return 1;
++    }
++    printf("storage opened: %s\n", argv[2]);
++
++    if (!strcmp(mode, "list")) {
++        const char *outList = (argc > 3) ? argv[3] : "casc-list.txt";
++        FILE *lf = fopen(outList, "w");
++        CASC_FIND_DATA fd;
++        memset(&fd, 0, sizeof(fd));
++        HANDLE h = CascFindFirstFile(storage, "*", &fd, NULL);
++        long long n = 0;
++        if (h && h != INVALID_HANDLE_VALUE) {
++            do {
++                n++;
++                if (lf) fprintf(lf, "%llu\t%s\n", (unsigned long long)fd.FileSize, fd.szFileName);
++                if (n <= 30) printf("  %s\n", fd.szFileName);
++            } while (CascFindNextFile(h, &fd));
++            CascFindClose(h);
++        } else {
++            fprintf(stderr, "find failed err=%u\n", GetCascError());
++        }
++        if (lf) fclose(lf);
++        printf("total files: %lld (list written to %s)\n", n, outList);
++    } else if (!strcmp(mode, "extract")) {
++        if (argc < 5) { fprintf(stderr, "extract needs <storage> <name> <outFile>\n"); return 2; }
++        unsigned long long total = 0;
++        if (!writeFile(storage, argv[3], argv[4], &total)) {
++            fprintf(stderr, "extract failed for %s (err=%u)\n", argv[3], GetCascError());
++            return 1;
++        }
++        printf("extracted %s -> %s (%llu bytes)\n", argv[3], argv[4], total);
++    } else if (!strcmp(mode, "extract-mask")) {
++        if (argc < 5) { fprintf(stderr, "extract-mask needs <storage> <mask> <outDir>\n"); return 2; }
++        std::string outDir = argv[4];
++        CASC_FIND_DATA fd;
++        memset(&fd, 0, sizeof(fd));
++        HANDLE h = CascFindFirstFile(storage, argv[3], &fd, NULL);
++        long long ok = 0, fail = 0;
++        if (h && h != INVALID_HANDLE_VALUE) {
++            do {
++                std::string dest = outDir + "/" + nameToPath(fd.szFileName);
++                unsigned long long total = 0;
++                if (writeFile(storage, fd.szFileName, dest, &total)) {
++                    ok++;
++                    if (ok % 500 == 0) printf("  ... %lld files\n", ok);
++                } else {
++                    fail++;
++                    if (fail <= 20) fprintf(stderr, "  FAIL(%u): %s\n", GetCascError(), fd.szFileName);
++                }
++            } while (CascFindNextFile(h, &fd));
++            CascFindClose(h);
++        } else {
++            fprintf(stderr, "find failed err=%u\n", GetCascError());
++        }
++        printf("extract-mask done: ok=%lld fail=%lld -> %s\n", ok, fail, argv[4]);
++    } else if (!strcmp(mode, "extract-list")) {
++        if (argc < 5) { fprintf(stderr, "extract-list needs <storage> <nameFile> <outDir>\n"); return 2; }
++        std::string outDir = argv[4];
++        FILE *nl = fopen(argv[3], "r");
++        if (!nl) { fprintf(stderr, "cannot open %s\n", argv[3]); return 2; }
++        char line[4096];
++        long long ok = 0, fail = 0;
++        while (fgets(line, sizeof(line), nl)) {
++            size_t len = strlen(line);
++            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
++            if (!len) continue;
++            std::string dest = outDir + "/" + nameToPath(line);
++            unsigned long long total = 0;
++            if (writeFile(storage, line, dest, &total)) {
++                ok++;
++                if (ok % 1000 == 0) printf("  ... %lld files\n", ok);
++            } else {
++                fail++;
++                if (fail <= 30) fprintf(stderr, "  FAIL(%u): %s\n", GetCascError(), line);
++            }
++        }
++        fclose(nl);
++        printf("extract-list done: ok=%lld fail=%lld -> %s\n", ok, fail, argv[4]);
++    } else {
++        fprintf(stderr, "unknown mode %s\n", mode);
++        return 2;
++    }
++
++    CascCloseStorage(storage);
++    return 0;
++}
+diff --git a/tools/casc/wc3mpq.cpp b/tools/casc/wc3mpq.cpp
+new file mode 100644
+index 00000000..7257491f
+--- /dev/null
++++ b/tools/casc/wc3mpq.cpp
+@@ -0,0 +1,70 @@
++// wc3mpq — bulk MPQ packer (StormLib) for the WC3 classic set.
++// usage: wc3mpq <archive.mpq> <manifest.tsv>
++//   manifest lines: <src-path>\t<archive-name>   (archive names use backslashes)
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <sys/stat.h>
++#include "StormLib.h"
++
++int main(int argc, char **argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <archive.mpq> <manifest.tsv>\n", argv[0]);
++        return 2;
++    }
++    FILE *m = fopen(argv[2], "r");
++    if (!m) { perror("manifest"); return 2; }
++
++    long long n = 0;
++    char line[4096];
++    while (fgets(line, sizeof(line), m)) if (line[0] && line[0] != '#') n++;
++    rewind(m);
++    if (n == 0) { fprintf(stderr, "empty manifest\n"); return 2; }
++
++    HANDLE h = NULL;
++    if (!SFileCreateArchive(argv[1], MPQ_CREATE_ARCHIVE_V1 | MPQ_CREATE_LISTFILE | MPQ_CREATE_ATTRIBUTES,
++                            (DWORD)(n + 256), &h)) {
++        fprintf(stderr, "create failed: %u\n", SErrGetLastError());
++        return 1;
++    }
++    SFileSetMaxFileCount(h, (DWORD)(n + 8192));
++
++    long long ok = 0, fail = 0, bytes = 0;
++    while (fgets(line, sizeof(line), m)) {
++        if (!line[0] || line[0] == '#') continue;
++        char *tab = strchr(line, '\t');
++        if (!tab) continue;
++        *tab = '\0';
++        char *name = tab + 1;
++        size_t ln = strlen(name);
++        while (ln && (name[ln - 1] == '\n' || name[ln - 1] == '\r')) name[--ln] = '\0';
++        if (!ln) continue;
++
++        struct stat st;
++        int r;
++        if (stat(line, &st) == 0 && st.st_size > 0 && st.st_size < (32LL * 1024 * 1024)) {
++            r = SFileAddFileEx(h, line, name, MPQ_FILE_COMPRESS, MPQ_COMPRESSION_ZLIB, MPQ_COMPRESSION_NEXT_SAME);
++            bytes += st.st_size;
++        } else if (st.st_size > 0) {
++            r = SFileAddFileEx(h, line, name, 0, 0, 0);
++            bytes += st.st_size;
++        } else {
++            r = SFileAddFileEx(h, line, name, 0, 0, 0); /* zero-byte ok */
++        }
++        if (!r) {
++            fail++;
++            if (fail <= 25) fprintf(stderr, "add fail (%u): %s -> %s\n", SErrGetLastError(), line, name);
++        } else {
++            ok++;
++            if (ok % 2000 == 0) printf("  ... %lld files\n", ok);
++        }
++    }
++    fclose(m);
++
++    if (!SFileCloseArchive(h)) {
++        fprintf(stderr, "close failed: %u\n", SErrGetLastError());
++        return 1;
++    }
++    printf("packed ok=%lld fail=%lld src_bytes=%lld -> %s\n", ok, fail, bytes, argv[1]);
++    return fail ? 1 : 0;
++}
+-- 
+2.47.3
+

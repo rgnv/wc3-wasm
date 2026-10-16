@@ -1,0 +1,36 @@
+From 87f275ff96fec4883f076fe80cf45cf716d6b695 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 11:08:31 -0700
+Subject: [PATCH 16/29] wc3: tolerate a missing loading screen at SV_Map
+ (browser FDF deferral)
+
+The browser build defers the menu FDF batch (documented wedge), so
+ge->PrepareMap cannot author the loading layout; SV_BuildLoadingScreen()
+then failed and SV_Map hard-shut the server down, killing the browser map
+boot mid-load. A missing layout is now non-fatal: the map load continues
+without a loading screen (native behavior is unchanged when the layout
+exists).
+---
+ server/sv_init.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/server/sv_init.c b/server/sv_init.c
+index c5e175ed..399f1e5e 100644
+--- a/server/sv_init.c
++++ b/server/sv_init.c
+@@ -446,7 +446,11 @@ void SV_Map(cstring_t mapFilename) {
+         CL_LoadingFrame();
+         return;
+     }
+-    if (!SV_BuildLoadingScreen()) { SV_Shutdown(); CL_LoadingFrame(); return; }
++    if (!SV_BuildLoadingScreen()) {
++        /* Non-fatal: browser builds defer the menu FDF batch and can lack a
++         * loading layout; the map load proceeds without a loading screen. */
++        fprintf(stderr, "SV_Map: continuing without a loading screen\n");
++    }
+     FOR_LOOP(i, svs.num_clients) {
+         client_t *cl = &svs.clients[i];
+         /* num_clients spans reusable holes after disconnects; send only to live peers. */
+-- 
+2.47.3
+

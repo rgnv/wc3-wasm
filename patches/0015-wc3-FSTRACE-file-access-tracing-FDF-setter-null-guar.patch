@@ -1,0 +1,71 @@
+From 4d4b2190427e8cb033bbaf453018944f64661c86 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 11:00:32 -0700
+Subject: [PATCH 15/29] wc3: FSTRACE file-access tracing + FDF setter null
+ guards
+
+- common.c: FS_ReadFile / FS_MmapFile log every requested path when
+  FSTRACE is set (webdata subset tracing for the wasm preload pipeline;
+  resolve the attempts against real data to build a boot subset).
+- stb_fdf.h: UI_SetParent / UI_SetSize / UI_SetTexture / UI_SetTexture2
+  gain the same null-frame guards as UI_SetEnabled / UI_SetHidden; the
+  modern-data HUD path passes absent templates (SimpleBuildQueueBackdrop)
+  and used to segfault on the first map boot.
+---
+ common/common.c                   | 2 ++
+ games/warcraft-3/common/stb_fdf.h | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/common/common.c b/common/common.c
+index ba37cf83..e5ccd72d 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -1142,6 +1142,7 @@ int FS_ReadFileQ3(cstring_t filename, void **buf) {
+ }
+ 
+ handle_t FS_ReadFile(cstring_t filename, uint32_t *size) {
++    if (getenv("FSTRACE")) fprintf(stderr, "FSTRACE %s\n", filename); /* webdata subset tracing */
+     handle_t fp = FS_OpenFile(filename);
+     uint32_t read_size = 0;
+     if (!fp) {
+@@ -1171,6 +1172,7 @@ void FS_FreeFile(void *buf) {
+ #ifndef _WIN32
+ #define MMAP_HDR_SIZE  16   /* must be >= 4+4+4 and page-aligned-friendly */
+ void *FS_MmapFile(cstring_t filename, uint32_t *out_size) {
++    if (getenv("FSTRACE")) fprintf(stderr, "FSTRACE %s\n", filename); /* webdata subset tracing */
+     FOR_LOOP(i, MAX_GAME_DIRS) {
+         char path[MAX_PATHLEN * 2];
+         int fd;
+diff --git a/games/warcraft-3/common/stb_fdf.h b/games/warcraft-3/common/stb_fdf.h
+index f3dae4dc..d982566c 100644
+--- a/games/warcraft-3/common/stb_fdf.h
++++ b/games/warcraft-3/common/stb_fdf.h
+@@ -846,10 +846,12 @@ void UI_SetAllPoints(frameDef_t *frame) {
+ /* ---- Simple property setters ---------------------------------------------- */
+ 
+ void UI_SetParent(frameDef_t *frame, frameDef_t const *parent) {
++    if (!frame) return;
+     frame->Parent = parent;
+ }
+ 
+ void UI_SetSize(frameDef_t *frame, float width, float height) {
++    if (!frame) return;
+     frame->Width = width;
+     frame->Height = height;
+ }
+@@ -2068,10 +2070,12 @@ cstring_t UI_GetString(cstring_t textID) {
+ }
+ 
+ void UI_SetTexture(frameDef_t *frame, cstring_t name, bool decorate) {
++    if (!frame) return;
+     frame->Texture.Image = UI_LoadTexture(name, decorate);
+ }
+ 
+ void UI_SetTexture2(frameDef_t *frame, cstring_t name, bool decorate) {
++    if (!frame) return;
+     frame->Texture.Image2 = UI_LoadTexture(name, decorate);
+ }
+ 
+-- 
+2.47.3
+

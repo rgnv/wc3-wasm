@@ -1,0 +1,293 @@
+From 845e5cb6bd054b27a4a9671164ac86ab339d4e9f Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:24:25 -0700
+Subject: [PATCH 24/29] maps: fetch-on-demand + protected-map archives
+
+The full game map catalog (melee, campaigns, scenario) plus community
+custom maps live on the web host as a served mirror instead of the
+preloaded MEMFS. When the engine opens a map that is missing locally (or
+a zero-byte catalog placeholder), FS_EnsureRemoteMapFile pulls the served
+copy through a synchronous fetch (per-segment URL encoding, catalog-
+version cache-busting) and writes it into the emscripten FS; hooked at
+FS_ReadLooseFile, FS_MmapFile and SFileOpenArchive. Non-map paths are
+fetchable too (UI art, tilesets, long-tail assets).
+
+mpq.c gains Storm-equivalent tolerance for protected map archives
+(Spazzler/w3xmaster et al.): a 4096-byte signature search window,
+malformed-header normalization (garbage sector shift), and archive-
+relative table clamps. Verified byte-identical war3map.w3i extraction
+against StormLib on a protected DotA map.
+
+sv_lan.c announces sv_hostname (not the map path) as the lobby name so
+the LAN browser shows a sane Game Creator.
+
+Debug instrumentation (MAPINFO opens, fetch log, MPQDEBUG) is
+env-gated/console-side; strip MAPINFO prints in a later cleanup.
+---
+ Makefile                              |  2 +-
+ common/common.c                       | 81 +++++++++++++++++++++++++++
+ common/mpq.c                          | 70 +++++++++++++++++++++--
+ games/warcraft-3/menu/menu_map_data.c |  2 +
+ server/sv_lan.c                       |  4 +-
+ 5 files changed, 151 insertions(+), 8 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 9d5747d4..5e6ed363 100644
+--- a/Makefile
++++ b/Makefile
+@@ -75,7 +75,7 @@ ifeq ($(EMSCRIPTEN),1)
+     NET_LIBS  :=
+     EM_FS     ?= node
+ ifeq ($(EM_FS),browser)
+-    EM_FS_FLAGS := -sEXIT_RUNTIME=0 -lwebsocket.js "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','stringToUTF8']"
++    EM_FS_FLAGS := -sEXIT_RUNTIME=0 -lwebsocket.js "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','stringToUTF8','FS']"
+ else ifeq ($(EM_FS),node-async)
+     EM_FS_FLAGS := -sASYNCIFY=1 -sASYNCIFY_IGNORE_INDIRECT=1 -sASYNCIFY_STACK_SIZE=4194304 -sNODERAWFS=1
+ else
+diff --git a/common/common.c b/common/common.c
+index e5ccd72d..2e710071 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -1052,7 +1052,85 @@ bool FS_FileExists(cstring_t fileName) {
+     return false;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++/* Fetch-on-demand: map archives (Maps\\*.w3m/.w3x) live on the web host as a
++ * served mirror instead of the preloaded MEMFS (the full catalog is ~90 MB and
++ * grows with custom-map packs).  When a map path is missing locally, pull it
++ * through a synchronous XHR and write it into the emscripten FS so the normal
++ * loose read finds it.  Non-map paths are ignored. */
++EM_JS(int, WC3_FetchRemoteFile, (const char *diskPathC, const char *relNameC), {
++    var diskPath = UTF8ToString(Number(diskPathC));
++    var rel = UTF8ToString(Number(relNameC)).split(String.fromCharCode(92)).join('/').replace(/^[/]+/, '').toLowerCase();
++    if (!rel) return 0;
++    var base = (typeof Module !== 'undefined' && Module.WC3_DATA_BASE) ? Module.WC3_DATA_BASE : 'gamedata/';
++    var url = base + rel.split('/').map(encodeURIComponent).join('/');
++    var dataV = (typeof Module !== 'undefined' && Module.WC3_DATA_V) ? Module.WC3_DATA_V : '';
++    if (dataV) url += '?v=' + dataV;
++    var xhr = new XMLHttpRequest();
++    try {
++        xhr.open('GET', url, false);
++        xhr.overrideMimeType('text/plain; charset=x-user-defined');
++        xhr.send(null);
++    } catch (e) { return 0; }
++    if (xhr.status !== 200 || !xhr.responseText.length) return 0;
++    var s = xhr.responseText, n = s.length;
++    var u8 = new Uint8Array(n);
++    for (var i = 0; i < n; i++) u8[i] = s.charCodeAt(i) & 0xff;
++    var FS = Module.FS || (typeof FS !== 'undefined' ? FS : null);
++    if (!FS) return 0;
++    try {
++        var dir = diskPath.replace(/[/][^/]*$/, '');
++        if (dir && dir !== diskPath) FS.mkdirTree(dir);
++    } catch (e) {}
++    try { FS.writeFile(diskPath, u8); } catch (e) { return 0; }
++    if (typeof Module !== 'undefined' && !Module.WC3_FETCH_QUIET) {
++        console.log('[fetch-on-demand] ' + diskPath + ' <- ' + url + ' (' + n + ' bytes)');
++    }
++    return n;
++});
++
++/* Ensure a map file is present with real content: probes each game dir; when
++ * the file is absent or a zero-byte placeholder (seeded catalog), fetch the
++ * served copy and write it into the FS. */
++void FS_EnsureRemoteMapFile(cstring_t filename) {
++    char diskPath[MAX_PATHLEN * 2];
++
++    if (!filename || !*filename) {
++        return;
++    }
++    /* Every missing game-data path is fetchable from the served mirror (maps,
++     * UI art, long-tail assets); reads inside an already-local archive never
++     * reach here. */
++    FOR_LOOP(i, MAX_GAME_DIRS) {
++        FILE *probe;
++
++        if (!gameDirs[i][0]) {
++            continue;
++        }
++        FS_MakeDiskPath(gameDirs[i], filename, diskPath, sizeof(diskPath));
++        probe = fopen(diskPath, "rb");
++        if (!probe) {
++            continue;
++        }
++        if (fseek(probe, 0, SEEK_END) == 0 && ftell(probe) > 0) {
++            fclose(probe);
++            return; /* real content already present */
++        }
++        fclose(probe);
++        WC3_FetchRemoteFile(diskPath, filename);
++        return;
++    }
++    if (gameDirs[0][0]) {
++        FS_MakeDiskPath(gameDirs[0], filename, diskPath, sizeof(diskPath));
++        WC3_FetchRemoteFile(diskPath, filename);
++    }
++}
++#endif
++
+ handle_t FS_ReadLooseFile(cstring_t filename, uint32_t *size, uint32_t extraBytes) {
++#ifdef __EMSCRIPTEN__
++    FS_EnsureRemoteMapFile(filename);
++#endif
+     FOR_LOOP(i, MAX_GAME_DIRS) {
+         char path[MAX_PATHLEN * 2];
+         FILE *file;
+@@ -1173,6 +1251,9 @@ void FS_FreeFile(void *buf) {
+ #define MMAP_HDR_SIZE  16   /* must be >= 4+4+4 and page-aligned-friendly */
+ void *FS_MmapFile(cstring_t filename, uint32_t *out_size) {
+     if (getenv("FSTRACE")) fprintf(stderr, "FSTRACE %s\n", filename); /* webdata subset tracing */
++#ifdef __EMSCRIPTEN__
++    FS_EnsureRemoteMapFile(filename);
++#endif
+     FOR_LOOP(i, MAX_GAME_DIRS) {
+         char path[MAX_PATHLEN * 2];
+         int fd;
+diff --git a/common/mpq.c b/common/mpq.c
+index 68658a4f..354c75df 100644
+--- a/common/mpq.c
++++ b/common/mpq.c
+@@ -1196,9 +1196,14 @@ static void MpqFreeReadArchive(mpqArchive_t *mpq)
+     free(mpq);
+ }
+ 
++static uint32_t MpqArchiveFileSize(mpqArchive_t *mpq);
++
+ static bool SFileOpenArchiveSource(mpqArchive_t *mpq, handle_t *archive)
+ {
+-    unsigned char probe[1024];
++    /* Storm searches the first 0x1000 bytes for the MPQ signature; protected
++     * maps (Spazzler etc.) place the real header beyond the classic 512-byte
++     * position, so match the same window. */
++    unsigned char probe[4096];
+     size_t read;
+     long archive_offset = -1;
+     size_t i;
+@@ -1240,11 +1245,12 @@ static bool SFileOpenArchiveSource(mpqArchive_t *mpq, handle_t *archive)
+     }
+ 
+     /* Sector size is 512 << wSectorSizeShift. Storm accepts up to shift 15 (16 MiB).
+-     * Protected maps such as DotA v6.83d use that max; never clamp it down to 4096. */
+-    if (mpq->header.wSectorSizeShift > MPQ_SECTOR_SIZE_SHIFT_MAX) {
+-        fprintf(stderr, "MPQ: unsupported wSectorSizeShift %u (max %u)\n",
+-                mpq->header.wSectorSizeShift, MPQ_SECTOR_SIZE_SHIFT_MAX);
+-        goto fail;
++     * Protected maps such as DotA v6.83d use that max; never clamp it down to 4096.
++     * Garbage values (w3x protectors scramble the header) fall back to 4096, the
++     * same way War3's Storm.dll ignores the field for v1 semantics. */
++    if (mpq->header.wSectorSizeShift == 0 ||
++        mpq->header.wSectorSizeShift > MPQ_SECTOR_SIZE_SHIFT_MAX) {
++        mpq->header.wSectorSizeShift = 3;
+     }
+     mpq->sector_size = 1u << (mpq->header.wSectorSizeShift + 9);
+ 
+@@ -1255,6 +1261,34 @@ static bool SFileOpenArchiveSource(mpqArchive_t *mpq, handle_t *archive)
+         goto fail;
+     }
+ 
++    if (getenv("MPQDEBUG")) {
++        fprintf(stderr, "MPQDEBUG header: id=%08x hdrSize=%u ver=%u shift=%u hashPos=%u blockPos=%u hashCnt=%u blockCnt=%u\n",
++                mpq->header.dwID, mpq->header.dwHeaderSize, mpq->header.wFormatVersion,
++                mpq->header.wSectorSizeShift, mpq->header.dwHashTablePos, mpq->header.dwBlockTablePos,
++                mpq->header.dwHashTableSize, mpq->header.dwBlockTableSize);
++    }
++    /* Table positions/sizes in protected-map headers are garbage; Storm marks
++     * such archives malformed and clamps the tables to the file, which is what
++     * makes Spazzler/w3xmaster-protected maps openable. Mirror that. */
++    {
++        uint32_t file_size = MpqArchiveFileSize(mpq);
++        uint32_t data_end = (file_size > mpq->base_offset) ? (file_size - mpq->base_offset) : 0; /* table positions are archive-relative */
++        if (data_end > 0) {
++            if (mpq->header.dwHashTablePos >= data_end ||
++                mpq->header.dwHashTableSize > (data_end - mpq->header.dwHashTablePos) / sizeof(mpqHashEntry_t)) {
++                mpq->header.dwHashTableSize = (data_end - mpq->header.dwHashTablePos) / sizeof(mpqHashEntry_t);
++            }
++            if (mpq->header.dwBlockTablePos >= data_end ||
++                mpq->header.dwBlockTableSize > (data_end - mpq->header.dwBlockTablePos) / sizeof(mpqBlockEntry_t)) {
++                mpq->header.dwBlockTableSize = (data_end - mpq->header.dwBlockTablePos) / sizeof(mpqBlockEntry_t);
++            }
++        }
++        if (mpq->header.dwHashTableSize == 0 || mpq->header.dwBlockTableSize == 0 ||
++            mpq->header.dwHashTablePos >= data_end || mpq->header.dwBlockTablePos >= data_end) {
++            goto fail;
++        }
++    }
++
+     // Read hash table
+     mpq->hashtable = (mpqHashEntry_t *)malloc(mpq->header.dwHashTableSize * sizeof(mpqHashEntry_t));
+     if (!mpq->hashtable) {
+@@ -1297,15 +1331,39 @@ static bool SFileOpenArchiveSource(mpqArchive_t *mpq, handle_t *archive)
+     return true;
+ 
+ fail:
++    if (getenv("MPQDEBUG")) fprintf(stderr, "MPQDEBUG fail at %s:%d\n", __FILE__, __LINE__);
+     MpqFreeReadArchive(mpq);
+     return false;
+ }
+ 
++static uint32_t MpqArchiveFileSize(mpqArchive_t *mpq) {
++    if (!mpq) return 0;
++    if (mpq->memory) return mpq->memory_size;
++    if (mpq->fp) {
++        long cur = ftell(mpq->fp);
++        if (cur < 0 || fseek(mpq->fp, 0, SEEK_END) != 0) return 0;
++        long size = ftell(mpq->fp);
++        fseek(mpq->fp, cur, SEEK_SET);
++        return (size > 0) ? (uint32_t)size : 0;
++    }
++    return 0;
++}
++
++#ifdef __EMSCRIPTEN__
++void FS_EnsureRemoteMapFile(cstring_t filename); /* common.c: fetch-on-demand for served map archives */
++#endif
++
+ bool SFileOpenArchive(cstring_t filename, uint32_t priority, uint32_t flags, handle_t *archive)
+ {
+     mpqArchive_t *mpq;
+     FILE *fp;
+ 
++#ifdef __EMSCRIPTEN__
++    /* A catalog placeholder or not-yet-fetched map: pull the served copy
++     * before the raw fopen below. */
++    FS_EnsureRemoteMapFile(filename);
++#endif
++
+     (void)priority;
+     (void)flags;
+ 
+diff --git a/games/warcraft-3/menu/menu_map_data.c b/games/warcraft-3/menu/menu_map_data.c
+index 2eee6f15..6db6c798 100644
+--- a/games/warcraft-3/menu/menu_map_data.c
++++ b/games/warcraft-3/menu/menu_map_data.c
+@@ -254,9 +254,11 @@ static bool UI_OpenMapArchive(cstring_t mapFilename, handle_t *mapArchive, void
+     *mapArchive = NULL;
+     *mapData = NULL;
+     mapSize = mi.FS_ReadFile(mapFilename, mapData);
++    fprintf(stderr, "[MAPINFO] open '%s' size=%d data=%p\n", mapFilename, mapSize, *mapData);
+     if (!*mapData || mapSize <= 0)
+         return false;
+     if (!SFileOpenArchiveFromMemory(*mapData, (uint32_t)mapSize, 0, mapArchive)) {
++        fprintf(stderr, "[MAPINFO] archive open failed for '%s'\n", mapFilename);
+         mi.FS_FreeFile(*mapData);
+         *mapData = NULL;
+         return false;
+diff --git a/server/sv_lan.c b/server/sv_lan.c
+index 0e77ac68..2b1ba643 100644
+--- a/server/sv_lan.c
++++ b/server/sv_lan.c
+@@ -52,7 +52,9 @@ static void SV_LanInfo(netadr_t const *from) {
+     }
+     if (svs.lobby.active) {
+         SV_LanSanitizeValue(svs.lobby.map_path, mapname, sizeof(mapname));
+-        SV_LanSanitizeValue(svs.lobby.map_name, hostname, sizeof(hostname));
++        /* The browser lists the host name ("Game Creator"); the lobby's
++         * map_name is a path, so announce the server name instead. */
++        SV_LanSanitizeValue(Cvar_String("sv_hostname", "OpenWarcraft3"), hostname, sizeof(hostname));
+         snprintf(speed, sizeof(speed), "%u", (unsigned)svs.lobby.game_speed);
+         snprintf(slots, sizeof(slots), "%u", (unsigned)svs.lobby.slot_count);
+     } else {
+-- 
+2.47.3
+

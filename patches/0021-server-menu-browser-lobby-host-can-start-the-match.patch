@@ -1,0 +1,428 @@
+From 32ab7ed8d59603d5aca77fb1338f6cb1c8314ef2 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 14:45:06 -0700
+Subject: [PATCH 21/29] server+menu: browser lobby host can start the match
+
+The game-setup screen's Start button now works for a remote (dedicated
+server) lobby host: the menu relays lobby_start_match to the server via
+the clc_stringcmd channel, and the server accepts lobby-mutating string
+commands (lobby_config / lobby_slot / lobby_start_match) only from the
+lobby host - the lowest-numbered connected client (the in-process
+loopback client on a listen server). The host flag travels in
+svc_lobby_setup right after local_slot so the setup screen enables the
+Start button only for the host; single-line commands are relayed via
+mi.ServerCommand while a local listen host keeps executing locally.
+
+Tests: server_net gains lobby_start_match_is_host_gated (non-host
+ignored, host start leaves the lobby); suites green (server_net
+3239/3239, menu 1433/1433).
+
+Also guard the game module's gi-fallback host services for emscripten
+only: the native module cannot link engine-level symbols (MemAlloc /
+FS_ReadFileQ3), which silently broke the native test-link of libgame.
+---
+ client/cl_parse.c                          |  2 +
+ common/shared.h                            |  1 +
+ games/warcraft-3/game/hud/hud.c            | 17 +++++
+ games/warcraft-3/menu/screens/game_setup.c | 26 +++++++-
+ games/warcraft-3/tests/test_server_net.c   | 36 +++++++++++
+ server/server.h                            |  6 ++
+ server/sv_lobby.c                          | 74 ++++++++++++++--------
+ server/sv_user.c                           | 43 +++++++++++++
+ 8 files changed, 178 insertions(+), 27 deletions(-)
+
+diff --git a/client/cl_parse.c b/client/cl_parse.c
+index 4216e261..ad59829e 100644
+--- a/client/cl_parse.c
++++ b/client/cl_parse.c
+@@ -954,6 +954,7 @@ static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+     }
+     state.slot_count = (uint32_t)slot_count;
+     state.local_slot = local_slot >= 0 && local_slot < MAX_PLAYERS ? (uint32_t)local_slot : MAX_PLAYERS;
++    state.is_host = MSG_ReadByte(msg) != 0;
+     FOR_LOOP(i, state.slot_count) {
+         lobbySlot_t *slot = &state.slots[i];
+         int client;
+@@ -979,6 +980,7 @@ static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+             (unsigned)state.slot_count,
+             (unsigned)state.local_slot,
+             (unsigned)state.revision);
++    fprintf(stderr, "CL_ParseLobbySetup: is_host=%d\n", state.is_host ? 1 : 0);
+     FOR_LOOP(i, state.slot_count) {
+         lobbySlot_t const *slot = &state.slots[i];
+ 
+diff --git a/common/shared.h b/common/shared.h
+index bd42a05b..cc738f1a 100644
+--- a/common/shared.h
++++ b/common/shared.h
+@@ -1480,6 +1480,7 @@ typedef struct lobbyState_s {
+     uint32_t slot_count;
+     uint32_t revision;
+     uint32_t local_slot;
++    bool is_host;
+     lobbySlot_t slots[MAX_PLAYERS];
+ } lobbyState_t;
+ 
+diff --git a/games/warcraft-3/game/hud/hud.c b/games/warcraft-3/game/hud/hud.c
+index 123e20fa..3b28fd88 100644
+--- a/games/warcraft-3/game/hud/hud.c
++++ b/games/warcraft-3/game/hud/hud.c
+@@ -858,12 +858,21 @@ void UI_LoadHud(void) {
+  * build every module shares one address space and the linker may bind the
+  * plain symbols here; the fallback keeps both contexts working. */
+ BZ_HOST_HIDDEN handle_t UI_FdfAlloc(long size) {
++#ifdef __EMSCRIPTEN__
++    /* wasm single-image boot: the menu may run this body with gi unfilled. */
+     if (gi.MemAlloc) return gi.MemAlloc(size);
+     return MemAlloc((size_t)size);
++#else
++    return gi.MemAlloc(size);
++#endif
+ }
+ BZ_HOST_HIDDEN void UI_FdfFree(handle_t ptr) {
++#ifdef __EMSCRIPTEN__
+     if (gi.MemFree) { gi.MemFree(ptr); return; }
+     MemFree(ptr);
++#else
++    gi.MemFree(ptr);
++#endif
+ }
+ BZ_HOST_HIDDEN int UI_FdfReadFile(cstring_t name, handle_t *out) {
+     if (gi.ReadFile) {
+@@ -871,11 +880,19 @@ BZ_HOST_HIDDEN int UI_FdfReadFile(cstring_t name, handle_t *out) {
+         *out = gi.ReadFile(name, &size);
+         return *out ? (int)size : -1;
+     }
++#ifdef __EMSCRIPTEN__
+     return FS_ReadFileQ3(name, (void **)out);
++#else
++    return -1;
++#endif
+ }
+ BZ_HOST_HIDDEN void UI_FdfFreeFile(handle_t buf) {
++#ifdef __EMSCRIPTEN__
+     if (gi.MemFree) { gi.MemFree(buf); return; }
+     MemFree(buf);
++#else
++    gi.MemFree(buf);
++#endif
+ }
+ 
+ /* Game module doesn't handle UI events or themes — stub these */
+diff --git a/games/warcraft-3/menu/screens/game_setup.c b/games/warcraft-3/menu/screens/game_setup.c
+index 146e8a2c..8c0b7c71 100644
+--- a/games/warcraft-3/menu/screens/game_setup.c
++++ b/games/warcraft-3/menu/screens/game_setup.c
+@@ -70,6 +70,7 @@ typedef struct {
+     bool chat_line_own[GAME_SETUP_CHAT_LINES];
+     uint32_t num_chat_lines;
+     bool applying_lobby;
++    bool is_host;
+     gameSetupSlotRow_t slots[MAX_PLAYERS];
+     gameSetupSlotConfig_t configs[MAX_PLAYERS];
+ } gameSetupState_t;
+@@ -185,7 +186,14 @@ static bool GameSetup_IsHost(void) {
+ 
+ static bool GameSetup_CanStart(void) {
+     bool const internet = !strcmp(mi.Cvar_String("online_mode", "0"), "1");
+-    return GameSetup_IsHost() && (!internet || (mi.Online_HostReady && mi.Online_HostReady()));
++
++    if (GameSetup_IsHost()) {
++        /* Local listen-server host (no connect target): it owns the server. */
++        return !internet || (mi.Online_HostReady && mi.Online_HostReady());
++    }
++    /* Dedicated server: the server designates the lobby host (first connected
++     * client) in svc_lobby_setup; only that client may start the match. */
++    return setup.is_host;
+ }
+ 
+ static void GameSetup_UpdateStartButton(void) {
+@@ -526,7 +534,11 @@ static void GameSetup_PublishSlot(uint32_t slot) {
+     }
+     command[0] = '\0';
+     GameSetup_AppendLobbySlot(command, sizeof(command), &used, slot);
+-    mi.Cmd_ExecuteText(command);
++    if (GameSetup_IsHost() || !mi.ServerCommand) {
++        mi.Cmd_ExecuteText(command);
++    } else {
++        mi.ServerCommand(command);
++    }
+ }
+ 
+ static void GameSetup_PublishLobby(void) {
+@@ -969,6 +981,15 @@ bool GameSetup_StartGame(void) {
+     if (!GameSetup_CanStart() || !setup.map_path[0]) {
+         return false;
+     }
++    if (!GameSetup_IsHost()) {
++        /* Dedicated-server lobby host: the server owns the map and lobby state
++         * already; ask it to start the match on the lobby map. */
++        if (!mi.ServerCommand) {
++            return false;
++        }
++        mi.ServerCommand("lobby_start_match");
++        return true;
++    }
+     command[0] = '\0';
+     slot_count = GameSetup_LobbySlotCount();
+     GameSetup_AppendLobbyConfig(command, sizeof(command), &used);
+@@ -1044,6 +1065,7 @@ void GameSetup_UpdateLobbySetup(lobbyState_t const *state) {
+         return;
+     }
+     setup.applying_lobby = true;
++    setup.is_host = state->is_host;
+     changed_map = strcmp(setup.map_path, state->map_path) != 0;
+     if (changed_map || !setup.ready) {
+         GameSetup_LoadMap(state->map_path);
+diff --git a/games/warcraft-3/tests/test_server_net.c b/games/warcraft-3/tests/test_server_net.c
+index b7675640..93ca1a29 100644
+--- a/games/warcraft-3/tests/test_server_net.c
++++ b/games/warcraft-3/tests/test_server_net.c
+@@ -1248,6 +1248,41 @@ TEST(server_net, lobby_rejects_remote_when_slots_full) {
+     test_mapinfo = NULL;
+ }
+ 
++/* The browser game-setup screen relays the host's Start press as this string
++ * command; the server must only honor it from the lobby host. */
++TEST(server_net, lobby_start_match_is_host_gated) {
++    uint8_t msg_buf[512];
++    sizeBuf_t msg;
++    client_t *host;
++    client_t *guest;
++
++    reset_server_state(4);
++    sv.state = ss_lobby;
++    svs.num_clients = 2;
++    host = &svs.clients[0];
++    guest = &svs.clients[1];
++    host->state = cs_connected;
++    guest->state = cs_connected;
++    SZ_Init(&host->netchan.message, host->netchan.message_buf, MAX_MSGLEN);
++    SZ_Init(&guest->netchan.message, guest->netchan.message_buf, MAX_MSGLEN);
++    svs.lobby.active = true;
++    snprintf(svs.lobby.map_path, sizeof(svs.lobby.map_path), "Maps\\Melee\\Test.w3m");
++
++    /* Non-host request is ignored; the lobby keeps running. (SV_ExecuteUserCommand
++     * receives the message positioned at the string payload: the caller consumes
++     * the clc_stringcmd byte.) */
++    SZ_Init(&msg, msg_buf, sizeof(msg_buf));
++    MSG_WriteString(&msg, "lobby_start_match");
++    SV_ExecuteUserCommand(&msg, guest);
++    T_EQ(sv.state, ss_lobby);
++
++    /* Host request starts the match: SV_Map leaves the lobby state. */
++    SZ_Init(&msg, msg_buf, sizeof(msg_buf));
++    MSG_WriteString(&msg, "lobby_start_match");
++    SV_ExecuteUserCommand(&msg, host);
++    T_ASSERT(sv.state != ss_lobby);
++}
++
+ TEST(server_net, lobby_setup_message_round_trips_slot_table) {
+     uint8_t msg_buf[MAX_MSGLEN];
+     sizeBuf_t msg = { msg_buf, MAX_MSGLEN, 0, 0 };
+@@ -1291,6 +1326,7 @@ TEST(server_net, lobby_setup_message_round_trips_slot_table) {
+     T_EQ(MSG_ReadByte(&msg), 3);
+     T_EQ(MSG_ReadByte(&msg), 2);
+     T_EQ(MSG_ReadByte(&msg), 1);
++    T_EQ(MSG_ReadByte(&msg), 1); /* lobby host flag: single connected client is the host */
+     T_EQ(MSG_ReadLong(&msg), 7);
+     FOR_LOOP(i, 1) {
+         T_EQ(MSG_ReadByte(&msg), 0);
+diff --git a/server/server.h b/server/server.h
+index c1f23de4..59a25eaf 100644
+--- a/server/server.h
++++ b/server/server.h
+@@ -165,6 +165,12 @@ void SV_LobbyInit(cstring_t mapFilename);
+ void SV_LobbyClientInit(client_t *cl, cstring_t userinfo);
+ void SV_LobbyRemoveClient(uint32_t clientnum);
+ bool SV_LobbyAssignClient(uint32_t clientnum, bool host);
++/* The effective lobby host is the lowest-numbered connected client (the in-process
++ * loopback client when running a listen server). Client string commands that alter
++ * the lobby or start the match are gated on this. */
++bool SV_LobbyClientIsHost(client_t *client);
++void SV_LobbyConfigCommand(int argc, cstring_t *argv);
++void SV_LobbySlotCommand(int argc, cstring_t *argv);
+ void SV_ApplyLobbySettings(mapInfo_t *info);
+ void SV_LobbyBroadcastSetup(void);
+ void SV_LobbyWriteSetup(client_t *cl);
+diff --git a/server/sv_lobby.c b/server/sv_lobby.c
+index e479dac6..024de50f 100644
+--- a/server/sv_lobby.c
++++ b/server/sv_lobby.c
+@@ -289,6 +289,17 @@ void SV_LobbyInit(cstring_t mapFilename) {
+     svs.lobby.local_slot = MAX_PLAYERS;
+ }
+ 
++bool SV_LobbyClientIsHost(client_t *client) {
++    FOR_LOOP(i, svs.num_clients) {
++        client_t *cl = &svs.clients[i];
++
++        if (cl->state == cs_connected || cl->state == cs_spawned) {
++            return cl == client;
++        }
++    }
++    return false;
++}
++
+ bool SV_LobbyAssignClient(uint32_t clientnum, bool host) {
+     uint32_t fallback = MAX_PLAYERS;
+ 
+@@ -331,6 +342,7 @@ void SV_LobbyWriteSetup(client_t *cl) {
+     MSG_WriteByte(&payload, (int)svs.lobby.game_speed);
+     MSG_WriteByte(&payload, (int)svs.lobby.slot_count);
+     MSG_WriteByte(&payload, local_slot < MAX_PLAYERS ? (int)local_slot : 255);
++    MSG_WriteByte(&payload, SV_LobbyClientIsHost(cl) ? 1 : 0);
+     MSG_WriteLong(&payload, (int)svs.lobby.revision);
+     FOR_LOOP(i, svs.lobby.slot_count) {
+         lobbySlot_t const *slot = &svs.lobby.slots[i];
+@@ -524,46 +536,58 @@ void SV_LobbyBroadcastChat(cstring_t sender, cstring_t text) {
+     SV_LobbyBroadcastChatFrom(MAX_CLIENTS, sender, text);
+ }
+ 
+-#ifndef TOOL_COMMON_NO_MPQ
+-static void SV_LobbySay_f(void) {
+-    SV_LobbyBroadcastChatFrom(0, "Player", Cmd_ArgsFrom(1));
+-}
+-
+-static void SV_LobbyConfig_f(void) {
+-    uint32_t speed;
+-    uint32_t slots;
+-
+-    if (Cmd_Argc() < 4) {
++/* Shared bodies: console (Cmd_*) and client string-command (argv) entry points. */
++void SV_LobbyConfigCommand(int argc, cstring_t *argv) {
++    if (argc < 4) {
+         fprintf(stderr, "usage: lobby_config <speed> <slots> <map_name>\n");
+         return;
+     }
+-    speed = (uint32_t)atoi(Cmd_Argv(1));
+-    slots = (uint32_t)atoi(Cmd_Argv(2));
+-    SV_LobbySetConfig(speed, slots, Cmd_ArgsFrom(3));
++    SV_LobbySetConfig((uint32_t)atoi(argv[1]), (uint32_t)atoi(argv[2]), argv[3]);
+     SV_LobbyBroadcastSetup();
+ }
+ 
+-static void SV_LobbySlot_f(void) {
++void SV_LobbySlotCommand(int argc, cstring_t *argv) {
+     lobbySlot_t slot;
+-    uint32_t slotnum;
+ 
+-    if (Cmd_Argc() < 9) {
++    if (argc < 9) {
+         fprintf(stderr, "usage: lobby_slot <slot> <visible> <map_player> <type> <race> <team> <color> <name>\n");
+         return;
+     }
+     memset(&slot, 0, sizeof(slot));
+-    slotnum = (uint32_t)atoi(Cmd_Argv(1));
+-    slot.visible = atoi(Cmd_Argv(2)) != 0;
+-    slot.map_player = (uint32_t)atoi(Cmd_Argv(3));
+-    slot.type = (lobbySlotType_t)atoi(Cmd_Argv(4));
+-    slot.race = (playerRace_t)atoi(Cmd_Argv(5));
+-    slot.team = (uint32_t)atoi(Cmd_Argv(6));
+-    slot.color = (uint32_t)atoi(Cmd_Argv(7));
++    slot.visible = atoi(argv[2]) != 0;
++    slot.map_player = (uint32_t)atoi(argv[3]);
++    slot.type = (lobbySlotType_t)atoi(argv[4]);
++    slot.race = (playerRace_t)atoi(argv[5]);
++    slot.team = (uint32_t)atoi(argv[6]);
++    slot.color = (uint32_t)atoi(argv[7]);
+     slot.client = MAX_CLIENTS;
+-    SV_LobbySanitizeText(Cmd_ArgsFrom(8), slot.name, sizeof(slot.name));
+-    SV_LobbySetSlot(slotnum, &slot);
++    SV_LobbySanitizeText(argv[8], slot.name, sizeof(slot.name));
++    SV_LobbySetSlot((uint32_t)atoi(argv[1]), &slot);
+     SV_LobbyBroadcastSetup();
+ }
++
++#ifndef TOOL_COMMON_NO_MPQ
++static void SV_LobbySay_f(void) {
++    SV_LobbyBroadcastChatFrom(0, "Player", Cmd_ArgsFrom(1));
++}
++
++static void SV_LobbyConfig_f(void) {
++    cstring_t argv[16];
++    int argc = Cmd_Argc();
++
++    if (argc > 16) argc = 16;
++    FOR_LOOP(i, argc) argv[i] = Cmd_Argv(i);
++    SV_LobbyConfigCommand(argc, argv);
++}
++
++static void SV_LobbySlot_f(void) {
++    cstring_t argv[16];
++    int argc = Cmd_Argc();
++
++    if (argc > 16) argc = 16;
++    FOR_LOOP(i, argc) argv[i] = Cmd_Argv(i);
++    SV_LobbySlotCommand(argc, argv);
++}
+ #endif
+ 
+ void SV_LobbyAddCommands(void) {
+diff --git a/server/sv_user.c b/server/sv_user.c
+index 79444a65..284b15c9 100644
+--- a/server/sv_user.c
++++ b/server/sv_user.c
+@@ -1,6 +1,11 @@
+ #include "server.h"
+ #include <stdlib.h>
+ 
++/* Host-gated lobby commands; defined below the ucmd table that references them. */
++static void SV_LobbyConfigClient_f(client_t *cl, int argc, cstring_t *argv);
++static void SV_LobbySlotClient_f(client_t *cl, int argc, cstring_t *argv);
++static void SV_LobbyStartMatchClient_f(client_t *cl, int argc, cstring_t *argv);
++
+ static uint32_t SV_ClientPlayerNumber(client_t *cl) {
+     return cl->playernum < MAX_PLAYERS ? cl->playernum : 0;
+ }
+@@ -175,9 +180,47 @@ ucmd_t ucmds[] = {
+     { "nodelta", SV_NoDelta_f },
+     { "disconnect", SV_Disconnect_f },
+     { "lobby_say", SV_LobbySayClient_f },
++    { "lobby_config", SV_LobbyConfigClient_f },
++    { "lobby_slot", SV_LobbySlotClient_f },
++    { "lobby_start_match", SV_LobbyStartMatchClient_f },
+     { NULL }
+ };
+ 
++/* Lobby-mutating commands are accepted from the lobby host only (the lowest
++ * connected client - the in-process loopback client on a listen server). The
++ * browser game-setup screen relays these through clc_stringcmd. */
++static void SV_LobbyConfigClient_f(client_t *cl, int argc, cstring_t *argv) {
++    if (!SV_LobbyClientIsHost(cl)) {
++        fprintf(stderr, "SV_Lobby: ignoring lobby_config from non-host client %s\n", cl->name);
++        return;
++    }
++    SV_LobbyConfigCommand(argc, argv);
++}
++
++static void SV_LobbySlotClient_f(client_t *cl, int argc, cstring_t *argv) {
++    if (!SV_LobbyClientIsHost(cl)) {
++        fprintf(stderr, "SV_Lobby: ignoring lobby_slot from non-host client %s\n", cl->name);
++        return;
++    }
++    SV_LobbySlotCommand(argc, argv);
++}
++
++static void SV_LobbyStartMatchClient_f(client_t *cl, int argc, cstring_t *argv) {
++    (void)argc;
++    (void)argv;
++
++    if (!SV_LobbyClientIsHost(cl)) {
++        fprintf(stderr, "SV_Lobby: ignoring start request from non-host client %s\n", cl->name);
++        return;
++    }
++    if (sv.state != ss_lobby || !svs.lobby.active || !svs.lobby.map_path[0]) {
++        fprintf(stderr, "SV_Lobby: start request ignored; no active lobby\n");
++        return;
++    }
++    fprintf(stderr, "SV_LobbyStartMatch: host %s starting match on %s\n", cl->name, svs.lobby.map_path);
++    SV_Map(svs.lobby.map_path);
++}
++
+ void SV_ExecuteUserCommand(sizeBuf_t *msg, client_t *client) {
+     typedef char cmdarg_t[CMDARG_LEN];
+     static cmdarg_t args[MAX_CMDARGS];
+-- 
+2.47.3
+

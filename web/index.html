@@ -1,0 +1,160 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Warcraft III — browser client</title>
+<style>
+  html, body { margin: 0; background: #000; overflow: hidden; height: 100%; overscroll-behavior: none; }
+  /* The engine adapts to whatever size the canvas is; fill the viewport so
+     portrait phones render edge-to-edge (dvh handles mobile URL-bar chrome). */
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; outline: none; touch-action: none; }
+  #status { position: fixed; left: 10px; top: 8px; color: #bbb; font: 12px/1.5 monospace;
+            text-shadow: 0 0 4px #000; pointer-events: none; }
+  #input-status { position: fixed; left: 10px; bottom: 8px; right: 10px; color: #888;
+                  font: 11px/1.4 monospace; text-shadow: 0 0 4px #000; pointer-events: none; }
+  .touch-mode { -webkit-user-select: none; user-select: none; }
+  #movie { display: none; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 20;
+           background: #000; object-fit: contain; }
+  #movie-tap { display: none; position: fixed; inset: 0; z-index: 21; color: #ddd;
+               font: 14px/1.6 monospace; text-align: center; padding-top: 45vh;
+               background: rgba(0,0,0,.55); cursor: pointer; }
+</style>
+<canvas id="canvas" width="1280" height="720" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+<div id="status">loading…</div>
+<div id="input-status"></div>
+<video id="movie" playsinline preload="none"></video>
+<div id="movie-tap">▶ click to play</div>
+<script>
+  window.__status = 'loading';
+  window.__logs = [];
+  window.__errors = [];
+  var st = document.getElementById('status');
+  function setStatus(s) { window.__status = s; st.textContent = s; if (s === 'runtime-initialized') st.style.display = 'none'; }
+  window.addEventListener('error', function (e) { window.__errors.push(String(e.message)); });
+  var Module = {
+    canvas: document.getElementById('canvas'),
+    ENV: Object.assign({},
+      (new URLSearchParams(location.search)).get('fow') === 'off' ? { W3_FOWOFF: '1' } : {},
+      (new URLSearchParams(location.search)).get('audio') === 'dummy' ? { SDL_AUDIODRIVER: 'dummy' } : {}),
+    arguments: ['-data', '/data', '+com_maxfps', '60', '+fs_expansion', '1'].concat((() => {
+      // Multiplayer transport: same-origin WS behind the site's /warcraft3/ws
+      // route (lang: the LAN browser joins through this). ?ws=... overrides
+      // for local/test runs; plain-http serves get no default.
+      const q = new URLSearchParams(location.search).get('ws');
+      const wsUrl = q || (location.protocol === 'https:'
+        ? 'wss://' + location.host + location.pathname.replace(/[^/]*$/, '') + 'ws'
+        : '');
+      return wsUrl ? ['+ws_url', wsUrl] : [];
+    })()),
+    print: function (t) { if (window.__logs.length < 2000) window.__logs.push(String(t)); },
+    printErr: function (t) { if (window.__errors.length < 4000) window.__errors.push(String(t)); },
+    WC3_DATA_BASE: 'gamedata/',   // served map-mirror root, relative to this page
+    onRuntimeInitialized: function () { setStatus('runtime-initialized'); seedMapCatalog(); },
+    locateFile: function (f) { return f + '?v=' + window.__BUILD; },
+    onAbort: function (why) { window.__errors.push('ABORT: ' + why); setStatus('aborted'); },
+    wc3PlayMovie: function (path) { if (window.__moviePlay) window.__moviePlay(String(path)); },
+  };
+  window.Module = Module;
+</script>
+<script>
+  // Fullscreen FMV overlay: the engine requests a movie by name; we play the
+  // transcoded MP4 (1280 tier, 640 fallback) and report completion back into
+  // the wasm via WC3_MovieDone. Click or Escape skips.
+  (function () {
+    var v = document.getElementById('movie');
+    var tap = document.getElementById('movie-tap');
+    function finish() {
+      if (v.style.display !== 'block') return;
+      v.pause(); v.removeAttribute('src'); v.load();
+      v.style.display = 'none'; tap.style.display = 'none';
+      try { if (window.Module && Module._WC3_MovieDone) Module._WC3_MovieDone(); } catch (e) {}
+    }
+    window.addEventListener('keydown', function (e) { if (e.key === 'Escape') finish(); });
+    v.addEventListener('click', finish);
+    window.__moviePlay = function (path) {
+      try {
+        var base = String(path).replace(/\\/g, '/').split('/').pop()
+          .replace(/\.(mpq|avi|mp4|bik)$/i, '').toLowerCase();
+        v.style.display = 'block';
+        v.src = 'movies/' + base + '_1280.webm';
+        var tried = false;
+        v.onended = finish;
+        v.onerror = function () {
+          if (!tried) { tried = true; v.src = 'movies/' + base + '_640.webm'; v.play().catch(showTap); return; }
+          finish();
+        };
+        function showTap() { tap.textContent = '\u25b6 click to play'; tap.style.display = 'block'; }
+        tap.onclick = function () { tap.style.display = 'none'; v.play().catch(showTap); };
+        var p = v.play();
+        if (p && p.catch) p.catch(showTap);
+      } catch (e) { window.__errors.push('movie: ' + e); finish(); }
+    };
+  })();
+</script>
+<script>
+  // Build-id negotiation: version.json is deployed with every bundle and served
+  // no-cache, so the wasm/data URLs ALWAYS change when the build changes (they
+  // are served immutable).  The URL ?v= stays as a manual override fallback.
+  window.__BUILD = (new URLSearchParams(location.search)).get('v') || '0';
+  (function () {
+    // Text files that the browser's sync-XHR text path would mangle are served
+    // as <path>.b64 sidecars; preload the index so the engine fetches exact
+    // bytes for them. Missing index = plain path (older mirrors).
+    try {
+      var b = new XMLHttpRequest();
+      b.open('GET', 'gamedata/b64.index.txt?' + window.__BUILD, false);
+      b.send();
+      if (b.status === 200) {
+        var set = new Set();
+        b.responseText.split(/\r?\n/).forEach(function (line) {
+          line = line.trim().toLowerCase();
+          if (line) set.add(line);
+        });
+        Module.WC3_B64_SET = set;
+      }
+    } catch (e) {}
+
+    function load() {
+      var s = document.createElement('script');
+      s.src = 'openwarcraft3.js?v=' + window.__BUILD;
+      document.head.appendChild(s);
+      var t = document.createElement('script');
+      t.src = 'wc3-input.js?v=' + window.__BUILD;
+      document.head.appendChild(t);
+    }
+    fetch('version.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { if (j && j.build) window.__BUILD = j.build; })
+      .catch(function () {})
+      .then(load);
+  })();
+
+  // Seed the full map catalog as zero-byte placeholders so the in-game map
+  // browser lists every map; opening one triggers the engine's fetch-on-demand
+  // (common.c WC3_FetchRemoteFile) which pulls the real archive from
+  // gamedata/ and writes it into the MEMFS. Failures leave the catalog as-is.
+  window.seedMapCatalog = function () {
+    var FS = (window.Module && Module.FS) || window.FS;
+    if (!FS) return;
+    fetch('gamedata/maps.index.txt', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (txt) {
+        var n = 0;
+        var h = 0;
+        for (var ci = 0; ci < txt.length; ci++) h = (h * 31 + txt.charCodeAt(ci)) | 0;
+        Module.WC3_DATA_V = String(h >>> 0);
+        txt.split('\n').forEach(function (line) {
+          line = line.trim();
+          if (!line) return;
+          var p = '/data/' + line.replace(/\\/g, '/');
+          try {
+            var dir = p.replace(/\/[^\/]*$/, '');
+            if (dir && dir !== p) FS.mkdirTree(dir);
+            FS.writeFile(p, new Uint8Array(0));
+            n++;
+          } catch (e) {}
+        });
+        window.__mapCatalog = n;
+      })
+      .catch(function () {});
+  };
+</script>

@@ -1,0 +1,46 @@
+From e01e30a6abe5e90573e6c0ef2ab592a4e5312d3a Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:18:02 -0700
+Subject: [PATCH 03/29] wasm: complete the emscripten link path
+
+- renderer/r_local.h: include GLES3/gl3.h for __EMSCRIPTEN__ (emcc defines neither __linux__ nor __APPLE__)
+- Makefile EM branch: wasm64 (MEMORY64=1 - 8-byte pointers the save format asserts on), 8MB stack, WebGL2 (MIN/MAX_WEBGL_VERSION=2), FULL_ES3=1 (provides the glMapBufferRange/glUnmapBuffer emulation), -Wl,--allow-multiple-definition for static module archives (parity with native ELF interposition when the app TU and libgame both define world-core symbols)
+- both wasm64 targets now link: openwarcraft3.js (SDL2+WebGL2 app) and openwarcraft3-tests.js (headless engine suite)
+---
+ Makefile           | 4 ++--
+ renderer/r_local.h | 2 ++
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index e87104ff..c6d7a0e9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -70,10 +70,10 @@ ifeq ($(EMSCRIPTEN),1)
+     INSTALL_NAME =
+     RPATH     :=
+     LIB_RPATH :=
+-    LDFLAGS   := -L$(LIB_DIR)
++    LDFLAGS   := -L$(LIB_DIR) -Wl,--allow-multiple-definition
+     LIBS      :=
+     NET_LIBS  :=
+-    CFLAGS    += -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1
++    CFLAGS    += -sMEMORY64=1 -sSTACK_SIZE=8388608 -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1
+     AR        := $(shell command -v llvm-ar 2>/dev/null || command -v ar)
+ else ifeq ($(OS),Windows_NT)
+ 	ifeq ($(GL_BACKEND),gles3)
+diff --git a/renderer/r_local.h b/renderer/r_local.h
+index 14b1fae6..3b5bcb0e 100644
+--- a/renderer/r_local.h
++++ b/renderer/r_local.h
+@@ -13,6 +13,8 @@
+ #else
+ #include <OpenGLES/ES3/gl.h>
+ #endif
++#elif defined(__EMSCRIPTEN__)
++#include <GLES3/gl3.h>
+ #elif __linux__ && defined(BZ_GL_ES3)
+ #include <GLES3/gl3.h>
+ #elif __linux__ || defined(__OpenBSD__)
+-- 
+2.47.3
+

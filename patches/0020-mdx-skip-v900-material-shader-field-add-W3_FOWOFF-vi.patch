@@ -1,0 +1,78 @@
+From 52b2abaf50da2080a27f804b477a1af4445b00ca Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:43:27 -0700
+Subject: [PATCH 20/29] mdx: skip v900+ material shader field; add W3_FOWOFF
+ visibility override
+
+Every v900/v1000 material carries an 80-byte shader name between its
+header and the LAYS section (all zeroes in SD data). The MTLS reader
+consumed that padding as an unknown tag and bailed before LAYS, leaving
+every material layerless and MDLX_MaterialHasPass false for all passes,
+so no model geometry ever drew (the menu glue scene, unit models, doodads
+- everything). Skip the field for version > 800; the LAYS scan then parses
+layers normally and models render: the browser main menu scene now draws
+(26/33 geosets opaque, was 0) and the map world presents its units.
+
+Also add a W3_FOWOFF env override in R_GetFogOfWarTexture that reports
+full visibility, for headless SwiftShader runs where the R8 fog network
+texture samples black.
+---
+ games/warcraft-3/renderer/mdx/r_mdx_load.c | 13 +++++++++++++
+ renderer/r_fogofwar.c                      |  3 +++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/games/warcraft-3/renderer/mdx/r_mdx_load.c b/games/warcraft-3/renderer/mdx/r_mdx_load.c
+index ad73d95c..13f1792c 100644
+--- a/games/warcraft-3/renderer/mdx/r_mdx_load.c
++++ b/games/warcraft-3/renderer/mdx/r_mdx_load.c
+@@ -8,6 +8,10 @@ for (type *property = list, *next = list ? (list)->next : NULL; \
+ property; \
+ property = next, next = next ? next->next : NULL)
+ #define SAFE_DELETE(x, func) if (x) { func(x); (x) = NULL; }
++
++/* Current MDX file version for version-dependent chunk deltas. VERS is always
++ * the first chunk, so material parsing can rely on it. */
++static uint32_t s_mdx_file_version;
+ #define SFileReadArray2(buffer, object, variable, elemsize) \
+ MSG_Read(buffer, &object->num_##variable, 4); \
+ if (object->num_##variable > 0) {object->variable = ri.MemAlloc(object->num_##variable * elemsize); \
+@@ -274,6 +278,14 @@ void ReadMaterial(sizeBuf_t *buffer, mdxMaterial_t *material) {
+     uint32_t blockHeader;
+     material->priority = MSG_ReadLong(buffer);
+     material->flags = MSG_ReadLong(buffer);
++    if (s_mdx_file_version > 800) {
++        /* v900+ materials carry a fixed 80-byte shader name between the header and
++         * the LAYS section (all zeroes in SD data; a real GLSL name in HD). Without
++         * this skip the LAYS scan reads the padding as an unknown tag and bails,
++         * leaving every material layerless -> no model ever draws. */
++        char shader[80];
++        MSG_Read(buffer, shader, 80);
++    }
+     while (MSG_Read(buffer, &blockHeader, 4)) {
+         switch (blockHeader) {
+             case ID_LAYS: ReadMaterialLayers(buffer, material); break;
+@@ -584,6 +596,7 @@ blockReadCode_t MDLX_ReadMODL(sizeBuf_t *sb, mdxModel_t *model) {
+ 
+ blockReadCode_t MDLX_ReadVERS(sizeBuf_t *sb, mdxModel_t *model) {
+     model->version = MSG_ReadLong(sb);
++    s_mdx_file_version = model->version;
+     /* 800 = RoC, 900 = TFT, 1000 = Reforged-era container. Modern SD game data
+      * ships every model as 1000 with the classic chunk layout, so accept all
+      * three; version-specific payload deltas are handled by the chunk readers. */
+diff --git a/renderer/r_fogofwar.c b/renderer/r_fogofwar.c
+index 07ab4c28..38a666c0 100644
+--- a/renderer/r_fogofwar.c
++++ b/renderer/r_fogofwar.c
+@@ -425,6 +425,9 @@ void R_ShutdownFogOfWar(void) {
+ }
+ 
+ uint32_t R_GetFogOfWarTexture(void) {
++    /* W3DBG-FOGOFF: headless SwiftShader cannot sample the R8 fog network (reads
++     * black), so this diagnostic build reports full visibility. Remove for ship. */
++    if (getenv("W3_FOWOFF")) return tr.texture[TEX_WHITE]->texid;
+     { static int _dbg = 0; if (!_dbg) { _dbg = 1; fprintf(stderr, "W3DBG fogtex network=%u rt=%u white=%u\n", fow_resources.network ? fow_resources.network->texid : 0, fow_resources.rt[FOW_RT_RESULT] ? fow_resources.rt[FOW_RT_RESULT]->texture : 0, tr.texture[TEX_WHITE] ? tr.texture[TEX_WHITE]->texid : 0); } }
+     if (fow_resources.network &&
+         !(tr.viewDef.rdflags & (RDF_NOFOG | RDF_NOWORLDMODEL))) {
+-- 
+2.47.3
+

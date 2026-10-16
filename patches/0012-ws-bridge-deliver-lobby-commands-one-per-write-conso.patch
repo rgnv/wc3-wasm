@@ -1,0 +1,48 @@
+From 9b9e594eb30adaa4a60f79515f078cda4baafdb4 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 01:58:53 -0700
+Subject: [PATCH 12/29] ws-bridge: deliver lobby commands one per write
+ (console batch quirk)
+
+The dedicated console does not reliably apply multi-line command batches
+delivered in a single write; commands are re-emitted one per write with a
+short delay. Verified: browser client takes slot 2 in the authoritative
+lobby and signs on for the match (CL_SendBegin) over WS->bridge->UDP.
+---
+ tools/ws-bridge/run-dedicated.sh | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/tools/ws-bridge/run-dedicated.sh b/tools/ws-bridge/run-dedicated.sh
+index aa7c6491..dceb4c7c 100755
+--- a/tools/ws-bridge/run-dedicated.sh
++++ b/tools/ws-bridge/run-dedicated.sh
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env bash
+ # Dedicated lobby server for the ws-bridge demo (fixture data, no GL needed).
+-# Command bursts come from /src/open-realm-em/tools/ws-bridge/wc3.cmds1 (lobby open + config) and
+-# /src/open-realm-em/tools/ws-bridge/wc3.cmds2 (slots + config re-assert), split by a pause: issuing
+-# lobby_slot in the same console batch as lobby_start does not stick.
++# Command bursts from tools/ws-bridge/wc3.cmds1 (lobby open + config) and
++# wc3.cmds2 (slots + config re-assert). NOTE: the engine's console does not
++# reliably apply multi-line command batches from a single write - commands are
++# therefore re-emitted ONE PER WRITE with a small delay (wc3.cmds2 loop).
+ # startmatch fires on a timer so a joining client can take a slot first.
+ # Run from the repo root, --network=host, CI image:
+ #   docker run -d --name wc3-dedicated --network=host \
+@@ -13,8 +14,11 @@
+   sleep 3
+   cat /src/open-realm-em/tools/ws-bridge/wc3.cmds1
+   sleep 2
+-  cat /src/open-realm-em/tools/ws-bridge/wc3.cmds2
+-  sleep 88
++  while IFS= read -r wc3line; do
++    echo "$wc3line"
++    sleep 0.5
++  done < /src/open-realm-em/tools/ws-bridge/wc3.cmds2
++  sleep 86
+   echo 'startmatch Maps\Transport.w3m'
+   sleep 86400
+ } | exec ./build/bin/openwarcraft3 -data /src/webdata +dedicated 1 +game_port 27960 +map 'Maps\Transport.w3m'
+-- 
+2.47.3
+

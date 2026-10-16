@@ -1,0 +1,606 @@
+From 1dc4fa6973dd0203823bd554cf6617f1dac669af Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:51:30 -0700
+Subject: [PATCH 17/29] wasm-port: render the 1.32 world end-to-end (client map
+ registration, unit model resolver, fog completeness)
+
+Three root causes fixed for the Reforged 1.32 data on both native and
+emscripten builds:
+
+- CL_BeginLoadingMap now registers the map with the renderer
+  (re.RegisterMap was previously only ever called with NULL, so terrain
+  layers were never built: layers=0 -> world pass empty).
+- g_metadata: the 1.32 UnitUI.slk dropped the model 'file' column; units
+  and buildings now resolve their models from the retail tree layout
+  (units/<race>/<name>/<name>.mdx, buildings/...) via a resolver with a
+  raw-id fallback. Previously every spawn fell to NOCLIENT (no models,
+  no sight, no fog reveal).
+- r_fogofwar: the client fog network texture now gets explicit
+  GL_NEAREST/LINEAR + CLAMP_TO_EDGE parameters after upload. Desktop GL
+  sampled the base level of an incomplete texture anyway; strict WebGL2
+  returns black, which made the wasm world render fogged-black.
+
+Also: BlzCreateUnitWithSkin API, W3DBG instrumentation probes (to be
+stripped before release), misc API surface additions from the bootybay +
+Blizzard.j native diff.
+---
+ client/cl_main.c                           |   3 +
+ client/cl_parse.c                          |   3 +
+ client/cl_view.c                           |   2 +
+ games/warcraft-3/game/api/api_misc.h       | 101 +++++++++++++++++++++
+ games/warcraft-3/game/api/api_module.c     |  59 ++++++++++++
+ games/warcraft-3/game/api/api_multiboard.h |  37 ++++++++
+ games/warcraft-3/game/api/api_player.h     |  39 ++++++++
+ games/warcraft-3/game/api/api_unit.h       |  12 +++
+ games/warcraft-3/game/g_fow.c              |  46 +++++++++-
+ games/warcraft-3/game/g_metadata.c         |  39 ++++++++
+ games/warcraft-3/game/g_spawn.c            |  10 ++
+ games/warcraft-3/renderer/w3m/r_war3map.c  |   2 +
+ renderer/r_fogofwar.c                      |   6 ++
+ 13 files changed, 354 insertions(+), 5 deletions(-)
+
+diff --git a/client/cl_main.c b/client/cl_main.c
+index 47b18b50..b17c4af4 100644
+--- a/client/cl_main.c
++++ b/client/cl_main.c
+@@ -559,6 +559,9 @@ void CL_BeginLoadingMap(cstring_t mapName) {
+     CL_ControlGroupsReset();
+     /* Publish the resolved map before freezing the plaque; menu launches have no startup map cvar. */
+     Cvar_Set("map", mapName);
++    /* Register the world with the renderer so the map's terrain and assets are built.
++     * Without this call the ground layers stay empty and the world renders black. */
++    if (mapName && *mapName) re.RegisterMap(mapName);
+     /* Same-map load keeps CS_WORLD unchanged; forget the previous world's begin
+      * so PrepRefresh sends it again and CL_ParseFrame can end the plaque. */
+     CL_RestartRefresh();
+diff --git a/client/cl_parse.c b/client/cl_parse.c
+index 6310d8b7..4216e261 100644
+--- a/client/cl_parse.c
++++ b/client/cl_parse.c
+@@ -798,6 +798,9 @@ static void CL_UpdateFogTextureRows(uint32_t first_row, uint32_t row_count) {
+     explored = cl.fow.explored + first;
+     FOR_LOOP(i, cells)
+         texture[i] = visible[i] ? 255 : (explored[i] ? 128 : 0);
++    { static int _d3 = 0; _d3++; if (_d3 == 50 || _d3 == 200 || _d3 == 500 || _d3 == 1000) { int _nz = 0;
++      for (uint32_t _j = 0; _j < (uint32_t)cl.fow.width * cl.fow.height; _j++) if (cl.fow.texture[_j]) _nz++;
++      fprintf(stderr, "W3DBG cl-fow compose #%d rows=%u..%u nonzero_total=%d\n", _d3, (unsigned)first_row, (unsigned)(first_row + row_count), _nz); } }
+ }
+ 
+ static uint8_t *CL_FogPlaneForStreamIndex(uint32_t flags, uint32_t stream_index) {
+diff --git a/client/cl_view.c b/client/cl_view.c
+index ced42f15..e91d054f 100644
+--- a/client/cl_view.c
++++ b/client/cl_view.c
+@@ -640,6 +640,7 @@ void V_RenderView(void) {
+     bool rebuild;
+     cl.viewDef.weather_effects = cl.weather_effects;
+     cl.viewDef.num_weather_effects = cl.num_weather_effects;
++    { static int _dbg3 = 0; if (!_dbg3) { _dbg3 = 1; fprintf(stderr, "W3DBG cl_fow w=%u h=%u data=%p\n", (unsigned)cl.fow.width, (unsigned)cl.fow.height, (void *)cl.fow.texture); } }
+     cl.viewDef.fow_width = cl.fow.width;
+     cl.viewDef.fow_height = cl.fow.height;
+     cl.viewDef.fow_data = cl.fow.texture;
+@@ -707,6 +708,7 @@ void V_RenderView(void) {
+ 
+     V_UpdateEnvironmentLighting(&cl.viewDef, true);
+     SCR_SetupViewBlend(&cl.viewDef, &cl.playerstate, cl.pics);
++    { static int _w3dbg = 0; if (!_w3dbg) { _w3dbg = 1; fprintf(stderr, "W3DBG cl_view main rdflags=0x%x ps_rdflags=0x%x eye=(%.0f %.0f %.0f) yaw=%.1f\n", (unsigned)cl.viewDef.rdflags, (unsigned)cl.playerstate.rdflags, cl.playerstate.vieworigin.x, cl.playerstate.vieworigin.y, cl.playerstate.vieworigin.z, cl.playerstate.viewangles.z); } }
+     re.RenderFrame(&cl.viewDef);
+     CL_DrawTEnts();
+     
+diff --git a/games/warcraft-3/game/api/api_misc.h b/games/warcraft-3/game/api/api_misc.h
+index 093b3c20..87aedac3 100644
+--- a/games/warcraft-3/game/api/api_misc.h
++++ b/games/warcraft-3/game/api/api_misc.h
+@@ -88,6 +88,45 @@ CONVERT_FUNC(RarityControl, raritycontrol);
+ CONVERT_FUNC(TexMapFlags, texmapflags);
+ CONVERT_FUNC(FogState, fogstate);
+ CONVERT_FUNC(EffectType, effecttype);
++CONVERT_FUNC(AnimType, animtype);
++CONVERT_FUNC(AbilityBooleanField, abilitybooleanfield);
++CONVERT_FUNC(AbilityBooleanLevelArrayField, abilitybooleanlevelarrayfield);
++CONVERT_FUNC(AbilityBooleanLevelField, abilitybooleanlevelfield);
++CONVERT_FUNC(AbilityIntegerField, abilityintegerfield);
++CONVERT_FUNC(AbilityIntegerLevelArrayField, abilityintegerlevelarrayfield);
++CONVERT_FUNC(AbilityIntegerLevelField, abilityintegerlevelfield);
++CONVERT_FUNC(AbilityRealField, abilityrealfield);
++CONVERT_FUNC(AbilityRealLevelArrayField, abilityreallevelarrayfield);
++CONVERT_FUNC(AbilityRealLevelField, abilityreallevelfield);
++CONVERT_FUNC(AbilityStringField, abilitystringfield);
++CONVERT_FUNC(AbilityStringLevelArrayField, abilitystringlevelarrayfield);
++CONVERT_FUNC(AbilityStringLevelField, abilitystringlevelfield);
++CONVERT_FUNC(ArmorType, armortype);
++CONVERT_FUNC(DefenseType, defensetype);
++CONVERT_FUNC(FrameEventType, frameeventtype);
++CONVERT_FUNC(FramePointType, framepointtype);
++CONVERT_FUNC(HeroAttribute, heroattribute);
++CONVERT_FUNC(ItemBooleanField, itembooleanfield);
++CONVERT_FUNC(ItemIntegerField, itemintegerfield);
++CONVERT_FUNC(ItemRealField, itemrealfield);
++CONVERT_FUNC(ItemStringField, itemstringfield);
++CONVERT_FUNC(MoveType, movetype);
++CONVERT_FUNC(OriginFrameType, originframetype);
++CONVERT_FUNC(OsKeyType, oskeytype);
++CONVERT_FUNC(PathingFlag, pathingflag);
++CONVERT_FUNC(RegenType, regentype);
++CONVERT_FUNC(SubAnimType, subanimtype);
++CONVERT_FUNC(TargetFlag, targetflag);
++CONVERT_FUNC(TextAlignType, textaligntype);
++CONVERT_FUNC(UnitBooleanField, unitbooleanfield);
++CONVERT_FUNC(UnitCategory, unitcategory);
++CONVERT_FUNC(UnitIntegerField, unitintegerfield);
++CONVERT_FUNC(UnitRealField, unitrealfield);
++CONVERT_FUNC(UnitStringField, unitstringfield);
++CONVERT_FUNC(UnitWeaponBooleanField, unitweaponbooleanfield);
++CONVERT_FUNC(UnitWeaponIntegerField, unitweaponintegerfield);
++CONVERT_FUNC(UnitWeaponRealField, unitweaponrealfield);
++CONVERT_FUNC(UnitWeaponStringField, unitweaponstringfield);
+ 
+ MATH_FUNC(Deg2Rad, DEG2RAD, number, number);
+ MATH_FUNC(Rad2Deg, RAD2DEG, number, number);
+@@ -2140,3 +2179,65 @@ uint32_t ReloadGameCachesFromDisk(jass_t *j) {
+     (void)j;
+     return jass_pushboolean(j, true);
+ }
++
++
++/* ---- missing-native coverage: camera/audio/save/campaign stubs (2026-10-14) ---- */
++uint32_t SetCameraRotateMode(jass_t *j) {
++    (void)jass_checknumber(j, 1); (void)jass_checknumber(j, 2);
++    (void)jass_checknumber(j, 3); (void)jass_checknumber(j, 4);
++    return 0;
++}
++uint32_t BlzCameraSetupApplyForceDurationSmooth(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "camerasetup");
++    (void)jass_checkboolean(j, 2);
++    (void)jass_checknumber(j, 3); (void)jass_checknumber(j, 4);
++    (void)jass_checknumber(j, 5); (void)jass_checknumber(j, 6);
++    return 0;
++}
++uint32_t SetCinematicAudio(jass_t *j) {
++    (void)jass_checkboolean(j, 1);
++    return 0;
++}
++uint32_t SetSoundPlayPosition(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "sound");
++    (void)jass_checkinteger(j, 2);
++    return 0;
++}
++uint32_t SetTerrainType(jass_t *j) {
++    (void)jass_checknumber(j, 1); (void)jass_checknumber(j, 2);
++    (void)jass_checkinteger(j, 3); (void)jass_checkinteger(j, 4);
++    (void)jass_checkinteger(j, 5); (void)jass_checkinteger(j, 6);
++    return 0;
++}
++uint32_t TimerDialogSetRealTimeRemaining(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "timerdialog");
++    (void)jass_checknumber(j, 2);
++    return 0;
++}
++uint32_t SaveGameCheckpoint(jass_t *j) {
++    (void)jass_checkstring(j, 1);
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
++uint32_t SetCustomCampaignButtonVisible(jass_t *j) {
++    (void)jass_checkinteger(j, 1);
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
++uint32_t SetMinimapIconOrphanDestroy(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "minimapicon");
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
++uint32_t SetUnitUseFood(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "unit");
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
++uint32_t TriggerRegisterCommandEvent(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "trigger");
++    (void)jass_checkinteger(j, 2);
++    (void)jass_checkstring(j, 3);
++    return jass_pushnullhandle(j, "event");
++}
++
+diff --git a/games/warcraft-3/game/api/api_module.c b/games/warcraft-3/game/api/api_module.c
+index 84fef067..62bf68ac 100644
+--- a/games/warcraft-3/game/api/api_module.c
++++ b/games/warcraft-3/game/api/api_module.c
+@@ -169,6 +169,45 @@ jassModule_t jass_funcs[] = {
+     { "ConvertTexMapFlags", ConvertTexMapFlags },
+     { "ConvertFogState", ConvertFogState },
+     { "ConvertEffectType", ConvertEffectType },
++    { "ConvertAnimType", ConvertAnimType },
++    { "ConvertAbilityBooleanField", ConvertAbilityBooleanField },
++    { "ConvertAbilityBooleanLevelArrayField", ConvertAbilityBooleanLevelArrayField },
++    { "ConvertAbilityBooleanLevelField", ConvertAbilityBooleanLevelField },
++    { "ConvertAbilityIntegerField", ConvertAbilityIntegerField },
++    { "ConvertAbilityIntegerLevelArrayField", ConvertAbilityIntegerLevelArrayField },
++    { "ConvertAbilityIntegerLevelField", ConvertAbilityIntegerLevelField },
++    { "ConvertAbilityRealField", ConvertAbilityRealField },
++    { "ConvertAbilityRealLevelArrayField", ConvertAbilityRealLevelArrayField },
++    { "ConvertAbilityRealLevelField", ConvertAbilityRealLevelField },
++    { "ConvertAbilityStringField", ConvertAbilityStringField },
++    { "ConvertAbilityStringLevelArrayField", ConvertAbilityStringLevelArrayField },
++    { "ConvertAbilityStringLevelField", ConvertAbilityStringLevelField },
++    { "ConvertArmorType", ConvertArmorType },
++    { "ConvertDefenseType", ConvertDefenseType },
++    { "ConvertFrameEventType", ConvertFrameEventType },
++    { "ConvertFramePointType", ConvertFramePointType },
++    { "ConvertHeroAttribute", ConvertHeroAttribute },
++    { "ConvertItemBooleanField", ConvertItemBooleanField },
++    { "ConvertItemIntegerField", ConvertItemIntegerField },
++    { "ConvertItemRealField", ConvertItemRealField },
++    { "ConvertItemStringField", ConvertItemStringField },
++    { "ConvertMoveType", ConvertMoveType },
++    { "ConvertOriginFrameType", ConvertOriginFrameType },
++    { "ConvertOsKeyType", ConvertOsKeyType },
++    { "ConvertPathingFlag", ConvertPathingFlag },
++    { "ConvertRegenType", ConvertRegenType },
++    { "ConvertSubAnimType", ConvertSubAnimType },
++    { "ConvertTargetFlag", ConvertTargetFlag },
++    { "ConvertTextAlignType", ConvertTextAlignType },
++    { "ConvertUnitBooleanField", ConvertUnitBooleanField },
++    { "ConvertUnitCategory", ConvertUnitCategory },
++    { "ConvertUnitIntegerField", ConvertUnitIntegerField },
++    { "ConvertUnitRealField", ConvertUnitRealField },
++    { "ConvertUnitStringField", ConvertUnitStringField },
++    { "ConvertUnitWeaponBooleanField", ConvertUnitWeaponBooleanField },
++    { "ConvertUnitWeaponIntegerField", ConvertUnitWeaponIntegerField },
++    { "ConvertUnitWeaponRealField", ConvertUnitWeaponRealField },
++    { "ConvertUnitWeaponStringField", ConvertUnitWeaponStringField },
+     { "OrderId", OrderId },
+     { "OrderId2String", OrderId2String },
+     { "UnitId", UnitId },
+@@ -494,6 +533,7 @@ jassModule_t jass_funcs[] = {
+     { "EnumItemsInRect", EnumItemsInRect },
+     { "CreateUnit", CreateUnit },
+     { "CreateUnitByName", CreateUnitByName },
++    { "BlzCreateUnitWithSkin", BlzCreateUnitWithSkin },
+     { "CreateUnitAtLoc", CreateUnitAtLoc },
+     { "CreateUnitAtLocByName", CreateUnitAtLocByName },
+     { "CreateCorpse", CreateCorpse },
+@@ -1266,5 +1306,24 @@ jassModule_t jass_funcs[] = {
+     { "ShowUbersplat", ShowUbersplat },
+     { "SetUbersplatRender", SetUbersplatRender },
+     { "SetUbersplatRenderAlways", SetUbersplatRenderAlways },
++    { "BlzGetPlayerTownHallCount", BlzGetPlayerTownHallCount },
++    { "SetPlayerHandicapDamage", SetPlayerHandicapDamage },
++    { "SetPlayerHandicapReviveTime", SetPlayerHandicapReviveTime },
++    { "CripplePlayer", CripplePlayer },
++    { "SetCameraRotateMode", SetCameraRotateMode },
++    { "BlzCameraSetupApplyForceDurationSmooth", BlzCameraSetupApplyForceDurationSmooth },
++    { "SetCinematicAudio", SetCinematicAudio },
++    { "SetSoundPlayPosition", SetSoundPlayPosition },
++    { "SetTerrainType", SetTerrainType },
++    { "TimerDialogSetRealTimeRemaining", TimerDialogSetRealTimeRemaining },
++    { "SaveGameCheckpoint", SaveGameCheckpoint },
++    { "SetCustomCampaignButtonVisible", SetCustomCampaignButtonVisible },
++    { "SetMinimapIconOrphanDestroy", SetMinimapIconOrphanDestroy },
++    { "SetUnitUseFood", SetUnitUseFood },
++    { "TriggerRegisterCommandEvent", TriggerRegisterCommandEvent },
++    { "SetTextTagPos", SetTextTagPos },
++    { "SetTextTagAge", SetTextTagAge },
++    { "SetTextTagSuspended", SetTextTagSuspended },
++    { "MultiboardSetTitleTextColor", MultiboardSetTitleTextColor },
+     { NULL },
+ };
+diff --git a/games/warcraft-3/game/api/api_multiboard.h b/games/warcraft-3/game/api/api_multiboard.h
+index 6ebbba32..f4df0484 100644
+--- a/games/warcraft-3/game/api/api_multiboard.h
++++ b/games/warcraft-3/game/api/api_multiboard.h
+@@ -291,3 +291,40 @@ uint32_t SetTextTagFadepoint(jass_t *j) {
+     }
+     return 0;
+ }
++
++
++/* ---- missing-native coverage: texttag + multiboard setters (2026-10-14) ---- */
++uint32_t SetTextTagPos(jass_t *j) {
++    texttag_t *tag = jass_checkhandle(j, 1, "texttag");
++    float x = jass_checknumber(j, 2), y = jass_checknumber(j, 3);
++    float heightOffset = jass_checknumber(j, 4);
++    if (tag && tag->inuse) {
++        tag->x = x; tag->y = y; tag->height_offset = heightOffset;
++        tag->has_position = true; tag->unit = NULL;
++        G_TextTagPresentation(tag, false);
++    }
++    return 0;
++}
++uint32_t SetTextTagAge(jass_t *j) {
++    texttag_t *tag = jass_checkhandle(j, 1, "texttag");
++    float age = jass_checknumber(j, 2);
++    if (tag && tag->inuse) {
++        tag->age = age;
++        G_TextTagPresentation(tag, false);
++    }
++    return 0;
++}
++uint32_t SetTextTagSuspended(jass_t *j) {
++    /* No suspended field in the level schema; consumed for validation only. */
++    (void)jass_checkhandle(j, 1, "texttag");
++    (void)jass_checkboolean(j, 2);
++    return 0;
++}
++uint32_t MultiboardSetTitleTextColor(jass_t *j) {
++    /* Multiboard title color is not modeled (title text only). */
++    (void)jass_checkhandle(j, 1, "multiboard");
++    (void)jass_checkinteger(j, 2); (void)jass_checkinteger(j, 3);
++    (void)jass_checkinteger(j, 4); (void)jass_checkinteger(j, 5);
++    return 0;
++}
++
+diff --git a/games/warcraft-3/game/api/api_player.h b/games/warcraft-3/game/api/api_player.h
+index 7cacf18b..0fc20708 100644
+--- a/games/warcraft-3/game/api/api_player.h
++++ b/games/warcraft-3/game/api/api_player.h
+@@ -802,3 +802,42 @@ uint32_t SelectUnit(jass_t *j) {
+     JassMarkSelectionDirty(currentplayer);
+     return 0;
+ }
++
++
++/* ---- missing-native coverage: melee victory/structure helpers + stubs (2026-10-14) ---- */
++static bool W3TownHallClass(uint32_t id) {
++    return id == MAKEFOURCC('h','t','o','w') || id == MAKEFOURCC('h','k','e','e') || id == MAKEFOURCC('h','c','a','s') ||
++           id == MAKEFOURCC('o','t','o','w') || id == MAKEFOURCC('o','s','t','w') || id == MAKEFOURCC('o','f','r','t') ||
++           id == MAKEFOURCC('u','n','p','l') || id == MAKEFOURCC('u','n','p','c') || id == MAKEFOURCC('u','n','p','1') || id == MAKEFOURCC('u','n','p','2') ||
++           id == MAKEFOURCC('e','t','o','l') || id == MAKEFOURCC('e','t','o','e') || id == MAKEFOURCC('e','t','o','a');
++}
++uint32_t BlzGetPlayerTownHallCount(jass_t *j) {
++    player_t *player = jass_checkhandle(j, 1, "player");
++    int32_t count = 0;
++    if (player) {
++        int32_t const pnum = PLAYER_NUM(player);
++        for (edict_t *ent = globals.edicts; ent - globals.edicts < globals.num_edicts; ent++) {
++            if (!ent->inuse || ent->s.player != (uint32_t)pnum || !G_UnitIsStructure(ent)) continue;
++            if (W3TownHallClass(ent->class_id)) count++;
++        }
++    }
++    return jass_pushinteger(j, count);
++}
++/* Reforged split handicaps are not modeled; values are consumed for validation only. */
++uint32_t SetPlayerHandicapDamage(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "player");
++    (void)jass_checknumber(j, 2);
++    return 0;
++}
++uint32_t SetPlayerHandicapReviveTime(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "player");
++    (void)jass_checknumber(j, 2);
++    return 0;
++}
++uint32_t CripplePlayer(jass_t *j) {
++    (void)jass_checkhandle(j, 1, "player");
++    (void)jass_checkhandle(j, 2, "force");
++    (void)jass_checkboolean(j, 3);
++    return 0;
++}
++
+diff --git a/games/warcraft-3/game/api/api_unit.h b/games/warcraft-3/game/api/api_unit.h
+index 2346d83a..e940449a 100644
+--- a/games/warcraft-3/game/api/api_unit.h
++++ b/games/warcraft-3/game/api/api_unit.h
+@@ -1331,6 +1331,18 @@ uint32_t CreateUnitByName(jass_t *j) {
+     //float face = jass_checknumber(j, 5);
+     return jass_pushnullhandle(j, "unit");
+ }
++/* Reforged-era variant: same as CreateUnit plus a trailing skinId (skins not modeled, ignored). */
++uint32_t BlzCreateUnitWithSkin(jass_t *j) {
++    player_t *player = jass_checkhandle(j, 1, "player");
++    uint32_t unitid = jass_checkinteger(j, 2);
++    vec2_t location = MAKE(vec2_t, jass_checknumber(j, 3), jass_checknumber(j, 4));
++    float facing = jass_checknumber(j, 5);
++    if (!player) {
++        return jass_pushnullhandle(j, "unit");
++    }
++    edict_t *unit = unit_create(PLAYER_NUM(player), unitid, &location, facing);
++    return jass_pushlighthandle(j, unit, "unit");
++}
+ uint32_t CreateUnitAtLoc(jass_t *j) {
+     player_t *player = jass_checkhandle(j, 1, "player");
+     uint32_t unitid = jass_checkinteger(j, 2);
+diff --git a/games/warcraft-3/game/g_fow.c b/games/warcraft-3/game/g_fow.c
+index 37d30334..5c9a433a 100644
+--- a/games/warcraft-3/game/g_fow.c
++++ b/games/warcraft-3/game/g_fow.c
+@@ -1038,18 +1038,50 @@ void G_FowUpdate(void) {
+         G_FowClearVisible(grid);
+     }
+ 
+-    FOR_LOOP(i, globals.num_edicts) {
++    { static int _call = 0;
++      int _seen = 0, _rad = 0, _total = 0, _inuse = 0, _owned = 0, _nocli = 0, _dead = 0, _sight = 0, _sample = -1;
++      _call++;
++      FOR_LOOP(i, globals.num_edicts) {
+         edict_t const *ent = &g_edicts[i];
+         float radius;
+         uint32_t unit_viewers;
+-
+-        if (ent->s.player >= MAX_PLAYERS || !G_FowEntityIsRevealer(ent)) {
+-            continue;
+-        }
++        _total++;
++        if (!ent->inuse) continue;
++        _inuse++;
++        if (ent->s.player >= MAX_PLAYERS) continue;
++        _owned++;
++        if (ent->svflags & SVF_NOCLIENT) { _nocli++; continue; }
++        if (M_IsDead((edict_t *)ent)) { _dead++; continue; }
++        if (G_FowEntitySightRadius(ent) > 0.0f) _sight++;
++        if (!G_FowEntityIsRevealer(ent)) continue;
+         unit_viewers = owner_viewers[ent->s.player] | (ent->shared_vision & viewers);
+         if (!unit_viewers) continue;
+         radius = G_FowEntitySightRadius(ent);
++        _seen++; if (radius > 0.0f) { _rad++; if (_sample < 0) _sample = i; }
+         G_FowRevealForViewers(ent, radius, unit_viewers);
++      }
++      if (_call == 240 || _call == 480 || _call == 960) {
++        fprintf(stderr, "W3DBG fow-update call=%d edicts=%d inuse=%d owned=%d nocli=%d dead=%d sight_gt0=%d revealers=%d\n", _call, _total, _inuse, _owned, _nocli, _dead, _sight, _seen);
++        { uint32_t _ids[64]; int _cl[64]; int _n = 0, _zero = 0, _live = 0, _live_nocli = 0, _live_sight = 0, _live_dead = 0;
++          FOR_LOOP(i, globals.num_edicts) {
++            edict_t const *ent = &g_edicts[i];
++            int k;
++            if (!ent->inuse) continue;
++            if (!ent->class_id) { _zero++; continue; }
++            _live++;
++            if (ent->svflags & SVF_NOCLIENT) _live_nocli++;
++            if (G_FowEntitySightRadius(ent) > 0.0f) _live_sight++;
++            if (M_IsDead((edict_t *)ent)) _live_dead++;
++            for (k = 0; k < _n; k++) if (_ids[k] == ent->class_id) break;
++            if (k == _n && _n < 64) { _ids[_n] = ent->class_id; _cl[_n] = 0; _n++; }
++            if (k < _n) _cl[k]++;
++          }
++          { extern uint32_t g_UnitBalanceCount, g_UnitUICount, g_DoodadsCount;
++            fprintf(stderr, "W3DBG census call=%d live=%d live_nocli=%d live_sight=%d live_dead=%d zero_slots=%d ub_rows=%u ui_rows=%u dd_rows=%u:", _call, _live, _live_nocli, _live_sight, _live_dead, _zero, g_UnitBalanceCount, g_UnitUICount, g_DoodadsCount); }
++          for (int k = 0; k < _n; k++) fprintf(stderr, " %.4s=%d", (char const *)&_ids[k], _cl[k]);
++          fprintf(stderr, "\n");
++        }
++      }
+     }
+ 
+     /* Timed spell reveals are not ordinary sight sources: Far Sight ignores
+@@ -1319,6 +1351,10 @@ static void G_FowSendDirtyPlane(edict_t *ent,
+             count++;
+         }
+         G_FowWriteRows(ent, player, plane_flag, first, count);
++        { static int _p0 = 0, _p1 = 0;
++          if (plane_flag == FOW_MSG_VISIBLE_PLANE && _p0 < 2) { _p0++; fprintf(stderr, "W3DBG fow-send visible rows first=%u count=%u\n", (unsigned)first, (unsigned)count); }
++          if (plane_flag != FOW_MSG_VISIBLE_PLANE && _p1 < 2) { _p1++; fprintf(stderr, "W3DBG fow-send explored rows first=%u count=%u\n", (unsigned)first, (unsigned)count); }
++        }
+     }
+ }
+ 
+diff --git a/games/warcraft-3/game/g_metadata.c b/games/warcraft-3/game/g_metadata.c
+index 9cdbb211..58cd8801 100644
+--- a/games/warcraft-3/game/g_metadata.c
++++ b/games/warcraft-3/game/g_metadata.c
+@@ -2463,6 +2463,44 @@ static void NormalizeArmorTypes(void) {
+         g_DestructableData[i].armor = G_NormalizeArmorType(g_DestructableData[i].armorSoundType, g_DestructableData[i].armor);
+ }
+ 
++
++/* The 1.32+ data drops the UnitUI "file" column; unit models resolve from the
++ * retail tree layout instead — units/<race>/<name>/<name>.mdx, structures under
++ * buildings/... . Rows that already carry an authored path are left alone. */
++static bool G_MapModelExists(cstring_t path) {
++    uint32_t size = 0;
++    handle_t data = gi.ReadFile(path, &size);
++    if (!data) return false;
++    gi.MemFree(data);
++    return true;
++}
++
++static void G_ResolveUnitModelPaths(void) {
++    FOR_LOOP(i, g_UnitUICount) {
++        UnitUI_t *ui = &g_UnitUI[i];
++        UnitData_t const *data;
++        PATHSTR path;
++        bool building;
++
++        if (ui->modelFile && *ui->modelFile) continue;
++        if (!ui->name || !*ui->name) continue;
++        data = G_UnitData(ui->id);
++        if (!data || !data->race || !*data->race) continue;
++        building = G_UnitIsBuilding(ui->id);
++        snprintf(path, sizeof(path), "%s\\%s\\%s\\%s.mdx",
++                 building ? "buildings" : "units", data->race, ui->name, ui->name);
++        if (!G_MapModelExists(path))
++            snprintf(path, sizeof(path), "%s\\%s\\%s\\%s.mdx",
++                     building ? "units" : "buildings", data->race, ui->name, ui->name);
++        if (!G_MapModelExists(path))
++            snprintf(path, sizeof(path), "%s\\%s\\%.4s\\%.4s.mdx",
++                     building ? "buildings" : "units", data->race,
++                     (char const *)&ui->id, (char const *)&ui->id);
++        if (!G_MapModelExists(path)) continue;
++        ui->modelFile = strdup(path);
++    }
++}
++
+ void InitUnitData(void) {
+     stbIniCache_t profile_ini = { 0 };
+ 
+@@ -2495,6 +2533,7 @@ void InitUnitData(void) {
+         if (store->idx) FS_SLKBuildIndex(store->idx, *store->rows, *store->count, store->row_size);
+     }
+     NormalizeArmorTypes();
++    G_ResolveUnitModelPaths();
+     ability_data_generation++;
+ }
+ 
+diff --git a/games/warcraft-3/game/g_spawn.c b/games/warcraft-3/game/g_spawn.c
+index 7ddd6d33..efffd2e3 100644
+--- a/games/warcraft-3/game/g_spawn.c
++++ b/games/warcraft-3/game/g_spawn.c
+@@ -598,6 +598,16 @@ void SP_CallSpawn(edict_t *edict) {
+         return;
+     edict->s.class_id = edict->class_id;
+     G_BindEntityData(edict);
++    { static int _d = 0;
++      if (!_d && (edict->class_id == MAKEFOURCC('h','t','o','w') || edict->class_id == MAKEFOURCC('h','p','e','a') || edict->class_id == MAKEFOURCC('n','g','a','d'))) {
++        _d = 1;
++        fprintf(stderr, "W3DBG SP_CallSpawn id=%.4s ub=%p ub_id=%.4s maxhp=%.0f sight=%.0f ui=%p model=%s\n",
++            (char const *)&edict->class_id, (void *)edict->data.UnitBalance,
++            (char const *)&edict->data.UnitBalance->id, (double)edict->data.UnitBalance->maxHealth,
++            (double)edict->data.UnitBalance->sightRadius,
++            (void *)edict->data.UnitUI, edict->data.UnitUI->modelFile ? edict->data.UnitUI->modelFile : "(null)");
++      }
++    }
+     if (edict->data.Doodads->id) {
+         SP_SpawnDoodad(edict);
+     } else if (edict->data.DestructableData->file) {
+diff --git a/games/warcraft-3/renderer/w3m/r_war3map.c b/games/warcraft-3/renderer/w3m/r_war3map.c
+index 64acbe50..5c1e2a9a 100644
+--- a/games/warcraft-3/renderer/w3m/r_war3map.c
++++ b/games/warcraft-3/renderer/w3m/r_war3map.c
+@@ -886,6 +886,7 @@ static void _W3M_SetSceneFog(void) {
+ }
+ 
+ void _W3M_DrawWorld(void) {
++    { static int _w3dbg2 = 0; if (!_w3dbg2) { int _n = 0; FOR_EACH_LIST(maplayer_t, _l, g_groundLayers) { _n++; } _w3dbg2 = 1; fprintf(stderr, "W3DBG _W3M_DrawWorld rdflags=0x%x layers=%d\n", (unsigned)tr.viewDef.rdflags, _n); } }
+     R_W3UpdateTerrainDeformations();
+     if (w3_terrain_rebuild_pending) {
+         R_W3EmitChangedTerrain();
+@@ -893,6 +894,7 @@ void _W3M_DrawWorld(void) {
+     }
+     if (tr.viewDef.rdflags & RDF_NOWORLDMODEL)
+         return;
++    { static int _w3dbg3 = 0; if (!_w3dbg3) { int _n = 0; uint32_t _v = 0; maplayer_t *_first = NULL; FOR_EACH_LIST(maplayer_t, _l, g_groundLayers) { _n++; _v += _l->num_vertices; if (!_first) _first = _l; } modelLighting_t _dbgl; bool _lite = R_LightingFromEnviron(&tr.viewDef.terrainLight, &_dbgl); _w3dbg3 = 1; fprintf(stderr, "W3DBG world-pass layers=%d verts=%u drawable=%ux%u vp=(%.2f %.2f %.2f %.2f) sc=(%.2f %.2f %.2f %.2f) lit=%d tex=%p\n", _n, (unsigned)_v, (unsigned)tr.drawableSize.width, (unsigned)tr.drawableSize.height, tr.viewDef.viewport.x, tr.viewDef.viewport.y, tr.viewDef.viewport.w, tr.viewDef.viewport.h, tr.viewDef.scissor.x, tr.viewDef.scissor.y, tr.viewDef.scissor.w, tr.viewDef.scissor.h, (int)_lite, (void *)(_first ? _first->texture : NULL)); } }
+ 
+     R_Call(glEnable, GL_DEPTH_TEST);
+     R_Call(glDepthMask, GL_TRUE);
+diff --git a/renderer/r_fogofwar.c b/renderer/r_fogofwar.c
+index e32928ef..07ab4c28 100644
+--- a/renderer/r_fogofwar.c
++++ b/renderer/r_fogofwar.c
+@@ -275,6 +275,7 @@ void R_RenderFogOfWar(void) {
+     uint32_t const texture_width = (tr.world->width - 1) * 4;
+     uint32_t const texture_height = (tr.world->height - 1) * 4;
+     uint32_t const num_revealers = R_CollectRevealers(revealers, MAX_FOGOFWAR_REVEALERS);
++    { static int _dbg2 = 0; if (!_dbg2) { _dbg2 = 1; fprintf(stderr, "W3DBG fow-render revealers=%u\n", (unsigned)num_revealers); } }
+ 
+     mat4_t model_matrix;
+     mat4_t proj_matrix;
+@@ -424,6 +425,7 @@ void R_ShutdownFogOfWar(void) {
+ }
+ 
+ uint32_t R_GetFogOfWarTexture(void) {
++    { static int _dbg = 0; if (!_dbg) { _dbg = 1; fprintf(stderr, "W3DBG fogtex network=%u rt=%u white=%u\n", fow_resources.network ? fow_resources.network->texid : 0, fow_resources.rt[FOW_RT_RESULT] ? fow_resources.rt[FOW_RT_RESULT]->texture : 0, tr.texture[TEX_WHITE] ? tr.texture[TEX_WHITE]->texid : 0); } }
+     if (fow_resources.network &&
+         !(tr.viewDef.rdflags & (RDF_NOFOG | RDF_NOWORLDMODEL))) {
+         return fow_resources.network->texid;
+@@ -475,6 +477,10 @@ void R_UpdateFogOfWarData(void) {
+     /* Existing storage must be updated, not redefined as the old per-FOW-chunk path did. */
+     if (allocate) {
+         R_Call(glTexImage2D, GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, data);
++        R_Call(glTexParameteri, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        R_Call(glTexParameteri, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        R_Call(glTexParameteri, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        R_Call(glTexParameteri, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+     } else {
+         R_Call(glTexSubImage2D, GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, data);
+     }
+-- 
+2.47.3
+

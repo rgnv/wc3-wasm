@@ -1,0 +1,37 @@
+From fae505ee24f43b5b9f117abbf076a237bdcbd6b1 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 01:04:21 -0700
+Subject: [PATCH 08/29] wasm: defer menu FDF batch for browser builds
+ (documented open issue)
+
+- browser builds wedge on the SECOND menu->client mi.FS_ReadFile call inside M_Init with or without asyncify (the first call, UI_LoadTheme, always completes; same-module HUD FDF reads are fine; node builds complete the batch cleanly) - a dedicated menu pass is needed on the emscripten runtime
+- map launches clear the menu and do not need these FDFs, so the batch is deferred under __EMSCRIPTEN__ for now
+- verified: browser build green with the deferral - map load, HUD (log flood), RAF frame loop at ~198% CPU, rendered pixels
+---
+ games/warcraft-3/menu/menu_main.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/games/warcraft-3/menu/menu_main.c b/games/warcraft-3/menu/menu_main.c
+index b365d5bb..c58db178 100644
+--- a/games/warcraft-3/menu/menu_main.c
++++ b/games/warcraft-3/menu/menu_main.c
+@@ -358,11 +358,14 @@ void M_Init(void) {
+     mi.Printf("M_Init: loading FDF assets\n");
+ 
+ #ifdef __EMSCRIPTEN__
+-    /* wasm port: the FDF batch is deferred while the browser indirect-read path
+-     * is being debugged (see project notes); map launches do not need menu FDFs. */
++    /* wasm port (open issue): the menu FDF batch wedges on its second cross-module
++     * mi.FS_ReadFile call under the browser runtime (see project notes). Map launches
++     * clear the menu and do not need these FDFs, so they are deferred for the browser
++     * build pending a dedicated menu pass. */
+ #else
+     UI_LoadTheme("UI\\war3skins.txt");
+     UI_ParseFDF("UI\\FrameDef\\GlobalStrings.fdf");
++
+     
+     /* Load core menu FDF files */
+     UI_ParseFDF("UI\\FrameDef\\UI\\EscMenuTemplates.fdf");
+-- 
+2.47.3
+

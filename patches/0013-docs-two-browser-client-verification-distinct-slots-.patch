@@ -1,0 +1,28 @@
+From 23b2d0f9919edc717fa67a5c118b2e8d5d9913a7 Mon Sep 17 00:00:00 2001
+From: "Ron D." <8740514+rgnv@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 06:19:23 -0700
+Subject: [PATCH 13/29] docs: two-browser-client verification (distinct slots,
+ both sign on)
+
+---
+ docs/emscripten-port.md | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/docs/emscripten-port.md b/docs/emscripten-port.md
+index cdb0bc6a..dc0f0e79 100644
+--- a/docs/emscripten-port.md
++++ b/docs/emscripten-port.md
+@@ -91,6 +91,10 @@ Verified end-to-end (fixture data): lobby join with live slot assignment
+ (lobby_setup stream revisions as the operator configures slots) and match
+ start (client follows the signon, switches to key_game, renders the world;
+ missing textures are expected - fixtures are not retail MPQs).
++Also verified with TWO browser clients simultaneously: distinct lobby slots
++(1 and 2, cross-visible occupancy in both clients) and both follow the signon
++into the match. The bridge gives each browser its own ephemeral UDP socket,
++so the server sees distinct client addresses.
+ 
+ ### Runbook
+ 
+-- 
+2.47.3
+
